@@ -18,6 +18,10 @@ entryPoints:
       middlewares: [gate@file]
   admin:
     address: "127.0.0.1:18081"
+  traefik:
+    address: "127.0.0.1:18082"
+api:
+  insecure: true
 providers:
   file:
     filename: dynamic.yml
@@ -43,6 +47,7 @@ http:
         killswitch:
           stateFile: $STATE
           admin: true
+          apiURL: http://127.0.0.1:18082
   routers:
     a:
       entryPoints: [web]
@@ -56,6 +61,10 @@ http:
       entryPoints: [web]
       rule: Host(\`ks.lan\`)
       middlewares: [ks-admin]
+      service: noop@internal
+    unprotected:
+      entryPoints: [admin]
+      rule: Host(\`c.lan\`)
       service: noop@internal
     admin:
       entryPoints: [admin]
@@ -104,7 +113,11 @@ expect "b passes again"      "$(code_within b.lan 418)" 418
 FROM=$(date -d '+1 hour' +%Y-%m-%dT%H:%M); TO=$(date -d '+2 hour' +%Y-%m-%dT%H:%M)
 expect "schedule b later"    "$(post -d "host=b.lan&action=schedule&mode=maint&from=$FROM&to=$TO")" 303
 expect "b passes before window" "$(code_within b.lan 418)" 418
+loc() { curl -s -o /dev/null -w '%{redirect_url}' "$@" http://127.0.0.1:18081/; }
+case "$(loc -d 'host=c.lan&mode=block')" in *unprotected%40file*) echo "ok   unprotected host c.lan refused";; *) echo "FAIL c.lan not refused"; exit 1;; esac
+case "$(loc -d 'host=typo.lan&mode=block')" in *No+Traefik+router*) echo "ok   unknown host refused";; *) echo "FAIL typo.lan not refused"; exit 1;; esac
 PAGE=$(curl -s http://127.0.0.1:18081/)
+echo "$PAGE" | grep -q '<li>c.lan <small>(unprotected@file)' && echo "ok   admin lists c.lan as not protected" || { echo "FAIL c.lan not listed as unprotected"; exit 1; }
 echo "$PAGE" | grep -q '(upcoming)' && echo "ok   admin shows upcoming window" || { echo "FAIL upcoming window not shown"; exit 1; }
 echo "$PAGE" | grep -q 'value="b.lan"' && echo "ok   admin lists seen host b.lan" || { echo "FAIL admin does not list seen host"; exit 1; }
 echo "$PAGE" | grep -q '<li>ks.lan</li>' && echo "ok   admin lists excluded host ks.lan as always on" || { echo "FAIL excluded host not shown"; exit 1; }

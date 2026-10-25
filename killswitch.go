@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -40,6 +41,9 @@ type Config struct {
 	Admin           bool     `json:"admin,omitempty"`
 	MaintenanceFile string   `json:"maintenanceFile,omitempty"`
 	ExcludeHosts    []string `json:"excludeHosts,omitempty"`
+	// APIURL (admin only) is Traefik's API, e.g. http://127.0.0.1:8080. With it the admin page knows
+	// which hosts have a router and whether that router uses the kill switch.
+	APIURL string `json:"apiURL,omitempty"`
 }
 
 // CreateConfig returns the default configuration.
@@ -67,6 +71,12 @@ type KillSwitch struct {
 	admin     bool
 	maintFile string
 	exclude   map[string]bool
+	apiURL    string
+
+	routesMu  sync.Mutex
+	routes    map[string]route
+	routesErr error
+	routesAt  time.Time
 
 	mu      sync.Mutex
 	state   map[string]string
@@ -87,7 +97,8 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		exclude[h] = true
 		list = append(list, h)
 	}
-	k := &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile, exclude: exclude}
+	k := &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile,
+		exclude: exclude, apiURL: strings.TrimRight(config.APIURL, "/")}
 	seenMu.Lock()
 	if !config.Admin {
 		excludedBy[name] = list
@@ -494,12 +505,219 @@ func (k *KillSwitch) update(host string, fn func(e *entry)) error {
 	return nil
 }
 
+// route is what Traefik's API says about one host: the routers serving it and which of them skip the kill switch.
+type route struct {
+	routers     []string
+	unprotected []string
+}
+
+func (r route) protected() bool { return len(r.unprotected) == 0 }
+
+type apiRouter struct {
+	Name        string   `json:"name"`
+	Rule        string   `json:"rule"`
+	Status      string   `json:"status"`
+	Middlewares []string `json:"middlewares"`
+}
+
+type apiMiddleware struct {
+	Name  string `json:"name"`
+	Chain *struct {
+		Middlewares []string `json:"middlewares"`
+	} `json:"chain"`
+}
+
+// hostRoutes returns host -> route from Traefik's API, cached for 10s. Without apiURL it returns nil, nil.
+func (k *KillSwitch) hostRoutes() (map[string]route, error) {
+	if k.apiURL == "" {
+		return nil, nil
+	}
+	k.routesMu.Lock()
+	defer k.routesMu.Unlock()
+	if time.Since(k.routesAt) < 10*time.Second {
+		return k.routes, k.routesErr
+	}
+	routes, err := fetchRoutes(k.apiURL)
+	k.routes = routes
+	k.routesErr = err
+	k.routesAt = time.Now()
+	if err != nil {
+		log.Printf("killswitch %s: reading Traefik API: %v", k.name, err)
+	}
+	return routes, err
+}
+
+var apiClient = &http.Client{Timeout: 3 * time.Second}
+
+// apiGet reads every page of a Traefik API list endpoint into out.
+func apiGet(base, path string, out func([]byte) error) error {
+	for page := 1; page < 100; page++ {
+		resp, err := apiClient.Get(base + path + "?per_page=500&page=" + strconv.Itoa(page))
+		if err != nil {
+			return err
+		}
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("%s: %s", path, resp.Status)
+		}
+		if err := out(b); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		next := resp.Header.Get("X-Next-Page")
+		if next == "" || next == "1" {
+			return nil
+		}
+	}
+	return nil
+}
+
+func fetchRoutes(base string) (map[string]route, error) {
+	var routers []apiRouter
+	err := apiGet(base, "/api/http/routers", func(b []byte) error {
+		var page []apiRouter
+		if err := json.Unmarshal(b, &page); err != nil {
+			return err
+		}
+		routers = append(routers, page...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	chains := map[string][]string{}
+	err = apiGet(base, "/api/http/middlewares", func(b []byte) error {
+		var page []apiMiddleware
+		if err := json.Unmarshal(b, &page); err != nil {
+			return err
+		}
+		for _, m := range page {
+			if m.Chain != nil {
+				chains[m.Name] = m.Chain.Middlewares
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	seenMu.Lock()
+	gates := map[string]bool{}
+	for name := range excludedBy {
+		gates[name] = true
+	}
+	seenMu.Unlock()
+
+	routes := map[string]route{}
+	for _, r := range routers {
+		if r.Status != "enabled" {
+			continue
+		}
+		gated := false
+		for _, m := range r.Middlewares {
+			if usesGate(m, chains, gates, 0) {
+				gated = true
+			}
+		}
+		for _, h := range hostsFromRule(r.Rule) {
+			rt := routes[h]
+			rt.routers = append(rt.routers, r.Name)
+			if !gated {
+				rt.unprotected = append(rt.unprotected, r.Name)
+			}
+			routes[h] = rt
+		}
+	}
+	return routes, nil
+}
+
+// usesGate reports whether middleware name is a kill switch gate, directly or inside a chain.
+func usesGate(name string, chains map[string][]string, gates map[string]bool, depth int) bool {
+	if gates[name] {
+		return true
+	}
+	if depth > 5 {
+		return false
+	}
+	provider := ""
+	if i := strings.LastIndex(name, "@"); i >= 0 {
+		provider = name[i:]
+	}
+	for _, m := range chains[name] {
+		if !strings.Contains(m, "@") {
+			m += provider // chain members are relative to the chain's provider
+		}
+		if usesGate(m, chains, gates, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostsFromRule extracts the names in Host(`a`) / Host(`a`, `b`) matchers; HostRegexp and HostSNI are skipped.
+func hostsFromRule(rule string) []string {
+	hosts := []string{}
+	for i := 0; i < len(rule); i++ {
+		if !strings.HasPrefix(rule[i:], "Host(") || (i > 0 && isIdent(rule[i-1])) {
+			continue
+		}
+		end := strings.Index(rule[i:], ")")
+		if end < 0 {
+			break
+		}
+		args := rule[i+5 : i+end]
+		for _, q := range []string{"`", `"`} {
+			parts := strings.Split(args, q)
+			for j := 1; j < len(parts); j += 2 {
+				hosts = append(hosts, strings.ToLower(parts[j]))
+			}
+		}
+		i += end
+	}
+	return hosts
+}
+
+func isIdent(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// checkHost decides whether host may be switched to mode. It returns an error to refuse,
+// or a warning to show while still saving. Switching on and cancelling are always allowed.
+func (k *KillSwitch) checkHost(host, mode, action string) (string, string) {
+	if host == allHosts || action == "unschedule" || (action == "" && mode == modeOn) {
+		return "", ""
+	}
+	routes, err := k.hostRoutes()
+	if routes != nil && err == nil {
+		r, ok := routes[host]
+		if !ok {
+			return "No Traefik router serves " + host + ", so switching it would do nothing. Check the spelling.", ""
+		}
+		if !r.protected() {
+			return host + " is served by " + strings.Join(r.unprotected, ", ") +
+				", which doesn't use the kill switch. Add the kill switch middleware to that router first.", ""
+		}
+		return "", ""
+	}
+	seenMu.Lock()
+	ok := seen[host]
+	seenMu.Unlock()
+	if !ok {
+		return "", "Saved, but no request for " + host + " has passed the kill switch since Traefik started. " +
+			"If its router doesn't use the kill switch middleware, this setting has no effect."
+	}
+	return "", ""
+}
+
 func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 	switch req.Method {
 	case http.MethodGet, http.MethodHead:
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		rw.Header().Set("Cache-Control", "no-store")
-		_, _ = rw.Write([]byte(k.renderAdmin(req.URL.Query().Get("err"))))
+		_, _ = rw.Write([]byte(k.renderAdmin(req.URL.Query().Get("err"), req.URL.Query().Get("warn"))))
 	case http.MethodPost:
 		if !sameOrigin(req) {
 			http.Error(rw, "cross-origin request refused", http.StatusForbidden)
@@ -526,6 +744,11 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 		}
 		if excludedHosts()[host] {
 			fail(host + " is in excludeHosts and is never switched off")
+			return
+		}
+		refuse, warn := k.checkHost(host, mode, action)
+		if refuse != "" {
+			fail(refuse)
 			return
 		}
 		user, ip := actor(req)
@@ -580,7 +803,11 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 		logInfo("%s", msg)
-		http.Redirect(rw, req, req.URL.Path, http.StatusSeeOther)
+		target := req.URL.Path
+		if warn != "" {
+			target += "?warn=" + url.QueryEscape(warn)
+		}
+		http.Redirect(rw, req, target, http.StatusSeeOther)
 	default:
 		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -645,6 +872,9 @@ button.active{color:#fff;background:var(--c);border-color:var(--c)}
 select{font:inherit;padding:.3rem .5rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text)}
 input{font:inherit;padding:.3rem .6rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);flex:1 1 14rem}
 .err{background:var(--err);border-radius:8px;padding:.6rem 1rem;color:var(--text)}
+.warn{background:color-mix(in srgb,var(--maint) 16%,transparent);border-radius:8px;padding:.6rem 1rem;color:var(--text)}
+.host small.bad{color:var(--block)}
+details.np summary h2{display:inline;font-size:1.05rem}details.np{margin-top:2rem}
 ul.excl{margin:0;padding:.6rem 1rem .6rem 2rem;color:var(--muted)}
 .sched{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .75rem;font-size:.9rem;color:var(--muted)}
 .sched b{color:var(--text)}details{flex-basis:100%}summary{cursor:pointer;color:var(--muted);font-size:.9rem}
@@ -713,13 +943,26 @@ func scheduleHTML(host string, e entry, tpls []string) string {
 	return b.String()
 }
 
-func (k *KillSwitch) renderAdmin(errMsg string) string {
+func (k *KillSwitch) renderAdmin(errMsg, warnMsg string) string {
 	state := k.load()
 	excluded := excludedHosts()
+	routes, apiErr := k.hostRoutes()
 	hosts := map[string]bool{}
 	for h := range state {
 		hosts[h] = true
 	}
+	unprotected := []string{}
+	for h, r := range routes {
+		if excluded[h] {
+			continue
+		}
+		if r.protected() {
+			hosts[h] = true
+		} else if !hosts[h] {
+			unprotected = append(unprotected, h)
+		}
+	}
+	sort.Strings(unprotected)
 	seenMu.Lock()
 	for h := range seen {
 		hosts[h] = true
@@ -760,6 +1003,12 @@ func (k *KillSwitch) renderAdmin(errMsg string) string {
 	if errMsg != "" {
 		b.WriteString(`<p class="err">` + html.EscapeString(errMsg) + `</p>`)
 	}
+	if warnMsg != "" {
+		b.WriteString(`<p class="warn">` + html.EscapeString(warnMsg) + `</p>`)
+	}
+	if apiErr != nil {
+		b.WriteString(`<p class="warn">Traefik API unreachable (` + html.EscapeString(apiErr.Error()) + `): can't check which hosts are protected.</p>`)
+	}
 	ge := parseEntry(state[allHosts])
 	g, gTpl, _ := ge.effective(t)
 	b.WriteString(`<div class="card"><div class="row all"><div class="host">All sites<small>Overrides every per-site setting while not "on"`)
@@ -770,12 +1019,28 @@ func (k *KillSwitch) renderAdmin(errMsg string) string {
 	for _, h := range list {
 		e := parseEntry(state[h])
 		m, tpl, _ := e.effective(t)
-		b.WriteString(`<div class="row"><div class="host">` + html.EscapeString(h) + `</div>` + pill(m, tpl) + modeButtons(h, e.mode, e.tpl, tpls) + scheduleHTML(h, e, tpls) + `</div>`)
+		note := ""
+		if routes != nil {
+			if r, ok := routes[h]; !ok {
+				note = `<small class="bad">no Traefik router: this setting does nothing</small>`
+			} else if !r.protected() {
+				note = `<small class="bad">not protected: ` + html.EscapeString(strings.Join(r.unprotected, ", ")) + ` doesn't use the kill switch</small>`
+			}
+		}
+		b.WriteString(`<div class="row"><div class="host">` + html.EscapeString(h) + note + `</div>` + pill(m, tpl) + modeButtons(h, e.mode, e.tpl, tpls) + scheduleHTML(h, e, tpls) + `</div>`)
 	}
 	if len(list) == 0 {
 		b.WriteString(`<div class="row"><p>No sites seen yet. They appear after their first request, or add one below.</p></div>`)
 	}
 	b.WriteString(`</div>`)
+	if len(unprotected) > 0 {
+		b.WriteString(`<details class="np"><summary><h2>Not protected (` + strconv.Itoa(len(unprotected)) + `)</h2></summary>` +
+			`<p>These hosts have a Traefik router without the kill switch middleware, so they can't be switched off here.</p><div class="card"><ul class="excl">`)
+		for _, h := range unprotected {
+			b.WriteString(`<li>` + html.EscapeString(h) + ` <small>(` + html.EscapeString(strings.Join(routes[h].unprotected, ", ")) + `)</small></li>`)
+		}
+		b.WriteString(`</ul></div></details>`)
+	}
 	if len(exList) > 0 {
 		b.WriteString(`<h2>Always on</h2><p>Listed in <code>excludeHosts</code>: never switched off, not even by "All sites".</p><div class="card"><ul class="excl">`)
 		for _, h := range exList {

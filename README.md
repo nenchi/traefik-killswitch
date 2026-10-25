@@ -103,6 +103,7 @@ Or add it to individual routers, e.g. with the Docker label
 | `stateFile`       | `/data/killswitch.json` | Shared JSON state. Must be writable for the admin instance.         |
 | `admin`           | `false`                 | Serve the web page instead of gating. Never forwards to a backend.  |
 | `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Edits apply immediately.   |
+| `apiURL`          | none                    | Admin only. Traefik's API (e.g. `http://127.0.0.1:8080`, needs `api.insecure` or another way to reach it from inside Traefik). Lets the admin page list every protected host and refuse hosts whose router doesn't use the kill switch. |
 | `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider. Listed on the admin page as "Always on". |
 
 You can also edit the state file by hand or from a script:
@@ -114,6 +115,19 @@ You can also edit the state file by hand or from a script:
 `maint:downtime` means maintenance mode with the `downtime` template (see below). A value can also carry
 a scheduled window: `"on|block|2026-10-26T22:00:00+01:00|2026-10-27T02:00:00+01:00"` means "normally on,
 blocked during that window".
+
+## Which hosts can be switched
+
+A host can only be switched off if its router uses the kill switch middleware. With `apiURL` set on the
+admin middleware, the plugin reads Traefik's routers and middlewares (including chains) every 10 seconds:
+
+- every protected host is listed right away, even before it gets traffic;
+- hosts whose router lacks the middleware are listed under **Not protected**, with the router names;
+- switching an unknown host (a typo) or an unprotected one is refused with an explanation.
+  Switching back **on** and cancelling a schedule always work.
+
+Without `apiURL`, switching a host that hasn't passed the kill switch since Traefik started saves the
+setting but shows a warning.
 
 ## Scheduled windows
 

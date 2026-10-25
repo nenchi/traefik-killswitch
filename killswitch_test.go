@@ -458,3 +458,123 @@ func TestLogging(t *testing.T) {
 	post(url.Values{"host": {"b.lan"}, "action": {"unschedule"}})
 	expectLog("KILL-SWITCH: schedule cancelled for b.lan by alice")
 }
+
+func TestHostsFromRule(t *testing.T) {
+	cases := map[string]string{
+		"Host(`a.lan`)":                              "a.lan",
+		"Host(`A.lan`) || Host(`b.lan`)":             "a.lan b.lan",
+		"Host(`a.lan`, `b.lan`) && PathPrefix(`/x`)": "a.lan b.lan",
+		"HostRegexp(`.+`) || HostSNI(`x`)":           "",
+		`Host("q.lan")`:                              "q.lan",
+	}
+	for rule, want := range cases {
+		if got := strings.Join(hostsFromRule(rule), " "); got != want {
+			t.Errorf("%s: got %q, want %q", rule, got, want)
+		}
+	}
+}
+
+func TestRouterCheck(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.URL.Path == "/api/http/routers" && req.URL.Query().Get("page") == "1":
+			rw.Header().Set("X-Next-Page", "2")
+			_, _ = rw.Write([]byte(`[{"name":"a@file","rule":"Host(` + "`a.lan`" + `)","status":"enabled","middlewares":["gate-rc"]},
+				{"name":"bc@docker","rule":"Host(` + "`b.lan`" + `) || Host(` + "`c.lan`" + `)","status":"enabled","middlewares":["chain1@file"]}]`))
+		case req.URL.Path == "/api/http/routers":
+			rw.Header().Set("X-Next-Page", "1")
+			_, _ = rw.Write([]byte(`[{"name":"d@docker","rule":"Host(` + "`d.lan`" + `)","status":"enabled","middlewares":["auth@file"]},
+				{"name":"c2@docker","rule":"Host(` + "`c.lan`" + `) && PathPrefix(` + "`/api`" + `)","status":"enabled"},
+				{"name":"off@docker","rule":"Host(` + "`off.lan`" + `)","status":"disabled","middlewares":["gate-rc"]}]`))
+		case req.URL.Path == "/api/http/middlewares":
+			_, _ = rw.Write([]byte(`[{"name":"chain1@file","chain":{"middlewares":["gate-rc"]}},{"name":"auth@file"}]`))
+		default:
+			http.NotFound(rw, req)
+		}
+	}))
+	defer api.Close()
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {})
+	if _, err := New(context.Background(), next, &Config{StateFile: stateFile}, "gate-rc"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		seenMu.Lock()
+		delete(excludedBy, "gate-rc")
+		delete(maintFiles, "gate-rc")
+		seenMu.Unlock()
+	}()
+	admin, err := New(context.Background(), next, &Config{StateFile: stateFile, Admin: true, APIURL: api.URL + "/"}, "admin-rc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// chain1@file contains "gate-rc" without a provider; it resolves to gate-rc@file, so register that too
+	seenMu.Lock()
+	excludedBy["gate-rc@file"] = nil
+	seenMu.Unlock()
+	defer func() { seenMu.Lock(); delete(excludedBy, "gate-rc@file"); seenMu.Unlock() }()
+
+	routes, err := admin.(*KillSwitch).hostRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !routes["a.lan"].protected() || !routes["b.lan"].protected() {
+		t.Fatalf("a/b should be protected: %+v", routes)
+	}
+	if routes["c.lan"].protected() || strings.Join(routes["c.lan"].unprotected, ",") != "c2@docker" {
+		t.Fatalf("c.lan has an unprotected second router: %+v", routes["c.lan"])
+	}
+	if _, ok := routes["off.lan"]; ok {
+		t.Fatal("disabled router counted")
+	}
+
+	post := func(host, mode, action string) string {
+		form := url.Values{"host": {host}, "mode": {mode}, "action": {action}}
+		if action == "schedule" {
+			form.Set("from", "2030-01-01T00:00")
+			form.Set("to", "2030-01-01T01:00")
+		}
+		req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		return rec.Header().Get("Location")
+	}
+	for _, c := range []struct{ host, mode, action, want string }{
+		{"a.lan", "block", "", ""},
+		{"b.lan", "maint", "", ""},
+		{"zz.lan", "block", "", "No+Traefik+router"},
+		{"d.lan", "block", "", "d%40docker"},
+		{"d.lan", "maint", "schedule", "d%40docker"},
+		{"d.lan", "on", "", ""},         // switching on is always allowed
+		{"d.lan", "", "unschedule", ""}, // and so is cancelling
+		{"*", "block", "", ""},
+	} {
+		loc := post(c.host, c.mode, c.action)
+		if c.want == "" && strings.Contains(loc, "err=") || c.want != "" && !strings.Contains(loc, c.want) {
+			t.Errorf("%s %s %s: redirect %q, want %q", c.host, c.mode, c.action, loc, c.want)
+		}
+	}
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
+	page := rec.Body.String()
+	np := strings.Index(page, "Not protected")
+	if np < 0 || !strings.Contains(page[np:], "<li>d.lan") || !strings.Contains(page[np:], "<li>c.lan") {
+		t.Fatal("unprotected hosts not listed")
+	}
+	if !strings.Contains(page[:np], `value="a.lan"`) {
+		t.Fatal("protected host from the API not listed before any traffic")
+	}
+}
+
+func TestUnseenHostWarnsWithoutAPI(t *testing.T) {
+	_, admin, _ := newPair(t)
+	form := url.Values{"host": {"never-seen.lan"}, "mode": {"block"}}
+	req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, req)
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "warn=") || strings.Contains(loc, "err=") {
+		t.Fatalf("want a warning, got %q", loc)
+	}
+}
