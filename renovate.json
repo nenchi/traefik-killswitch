@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "platformAutomerge": false,
+  "customManagers": [
+    {
+      "description": "Traefik and Yaegi versions the CI tests run against (# renovate: comments in ci.yml)",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+: (?<currentValue>\\S+)"]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "GitHub Actions minor/patch: merged once CI is green, no release (the plugin doesn't change); major by hand",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    },
+    {
+      "description": "Traefik/Yaegi test versions minor/patch: CI runs the plugin against the new version; merged when green, no release. A red PR means the new Traefik broke the plugin.",
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    },
+    {
+      "description": "Major updates (Traefik v4): PR only, merged by hand",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}
