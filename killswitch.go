@@ -337,13 +337,15 @@ func (e entry) createdLabel() string {
 	return l + ")"
 }
 
-// actor names who made an admin change, for the log: the SSO or basic-auth user, and the client IP.
+// actor names who made an admin change, for the log: the basic-auth or SSO user, and the client IP.
+// Basic auth wins: Traefik checked it, while X-Authentik-Username is only trustworthy when forwardAuth set it,
+// and a client could send it itself on a router without Authentik.
 func actor(req *http.Request) (string, string) {
-	user := req.Header.Get("X-Authentik-Username")
-	if user == "" {
-		if u, _, ok := req.BasicAuth(); ok {
-			user = u
-		}
+	user := ""
+	if u, _, ok := req.BasicAuth(); ok {
+		user = u
+	} else {
+		user = req.Header.Get("X-Authentik-Username")
 	}
 	// Keep it a plain token: it's stored in the state value and written to logs.
 	user = strings.Map(func(r rune) rune {

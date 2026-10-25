@@ -718,3 +718,18 @@ func TestHistoryTrim(t *testing.T) {
 		t.Fatalf("got %d lines, newest %q", len(lines), lines[0][:40])
 	}
 }
+
+func TestActorPrefersBasicAuth(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", nil)
+	req.SetBasicAuth("alice", "pw")
+	req.Header.Set("X-Authentik-Username", "mallory")
+	req.Header.Set("X-Real-Ip", "192.0.2.9")
+	if user, ip := actor(req); user != "alice" || ip != "192.0.2.9" {
+		t.Fatalf("got %q %q, want basic-auth user alice", user, ip)
+	}
+	req = httptest.NewRequest(http.MethodPost, "http://ks.lan/", nil)
+	req.Header.Set("X-Authentik-Username", "bob|x")
+	if user, _ := actor(req); user != "bobx" {
+		t.Fatalf("SSO user: got %q, want bobx (pipe stripped)", user)
+	}
+}
