@@ -84,6 +84,7 @@ type KillSwitch struct {
 	modTime time.Time
 	size    int64
 	checked time.Time
+	gen     int
 }
 
 // New creates the middleware.
@@ -583,13 +584,28 @@ func templates() []string {
 }
 
 // load returns the cached state, re-reading the file when its mtime changes (checked at most once a second).
+// stateGen counts saves from the admin page; every instance re-reads the state file when it changes,
+// so a switch applies on the very next request. The 1s re-check only covers edits made outside the plugin.
+var (
+	stateGenMu sync.Mutex
+	stateGen   int
+)
+
+func currentGen() int {
+	stateGenMu.Lock()
+	defer stateGenMu.Unlock()
+	return stateGen
+}
+
 func (k *KillSwitch) load() map[string]string {
+	gen := currentGen()
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if time.Since(k.checked) < time.Second && k.state != nil {
+	if time.Since(k.checked) < time.Second && k.state != nil && k.gen == gen {
 		return k.state
 	}
 	k.checked = time.Now()
+	k.gen = gen
 	if k.state == nil {
 		k.state = map[string]string{}
 	}
@@ -666,9 +682,9 @@ func (k *KillSwitch) update(host string, fn func(e *entry)) error {
 	if err := os.Rename(tmp, k.stateFile); err != nil {
 		return err
 	}
-	k.mu.Lock()
-	k.checked = time.Time{} // force reload on next request
-	k.mu.Unlock()
+	stateGenMu.Lock()
+	stateGen++ // every instance reloads on its next request
+	stateGenMu.Unlock()
 	return nil
 }
 
@@ -1072,7 +1088,12 @@ details input{flex:0 1 auto}
 func modeButtons(host, cur, curTpl string, tpls []string) string {
 	var b strings.Builder
 	b.WriteString(`<form method="post"><input type="hidden" name="host" value="` + html.EscapeString(host) + `">`)
-	b.WriteString(templateSelect(tpls, curTpl))
+	sel := templateSelect(tpls, curTpl)
+	if cur == modeMaint {
+		// In maint, picking another page applies it at once (submits the row as "maint").
+		sel = strings.Replace(sel, `<select `, `<select onchange="this.form.requestSubmit(this.form.querySelector('button.maint'))" `, 1)
+	}
+	b.WriteString(sel)
 	for _, m := range []string{modeOn, modeMaint, modeBlock} {
 		active := ""
 		if m == cur {
@@ -1211,7 +1232,7 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string) string {
 <title>Kill switch</title>` + adminStyle + `<main><div class="top"><h1>Kill switch</h1><a href="?view=history">History</a></div>
 <p><b>on</b> serves the site, <b>maint</b> shows the maintenance page (503), <b>block</b> refuses every request (403).</p>`)
 	if len(tpls) > 0 {
-		b.WriteString(`<p>Pick a page in the list, then click <b>maint</b>. Clicking <b>maint</b> again switches a site to the newly picked page.</p>`)
+		b.WriteString(`<p>Pick a page in the list, then click <b>maint</b>. While a site is in maint, picking another page switches it right away.</p>`)
 	}
 	b.WriteString(`<p>Schedules use server time (` + t.Format("MST") + `, now ` + t.Format(timeFmt) + `). A site switches back to its normal mode when its window ends.</p>`)
 	if errMsg != "" {

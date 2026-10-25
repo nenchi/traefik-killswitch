@@ -94,6 +94,11 @@ expect "a maintenance"       "$(code_within a.lan 503)" 503
 expect "a default page"      "$(body_within a.lan default-page)" default-page
 expect "set a=maint:downtime" "$(set_mode a.lan maint downtime)" 303
 expect "a downtime page"     "$(body_within a.lan downtime-page)" downtime-page
+# no polling: an admin change must apply on the very next request
+expect "switch page instantly" "$(set_mode a.lan maint back)" 303
+expect "new page on next request" "$(curl -s -H 'Host: a.lan' http://127.0.0.1:18080/)" "back: soon"
+expect "back to downtime"    "$(set_mode a.lan maint downtime)" 303
+expect "instant again"       "$(curl -s -H 'Host: a.lan' http://127.0.0.1:18080/)" downtime-page
 expect "b still passes"      "$(code_within b.lan 418)" 418
 expect "set *=block"         "$(set_mode '*' block)" 303
 expect "b blocked by global" "$(code_within b.lan 403)" 403

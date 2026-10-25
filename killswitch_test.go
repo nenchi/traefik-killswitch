@@ -799,3 +799,34 @@ func TestAdminFavicon(t *testing.T) {
 		}
 	}
 }
+
+func TestSwitchAppliesImmediately(t *testing.T) {
+	gate, admin, _ := newPair(t)
+	get := func() int { // no cache reset: must see admin changes on the very next request
+		rec := httptest.NewRecorder()
+		gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://a.lan/", nil))
+		return rec.Code
+	}
+	if c := get(); c != 200 {
+		t.Fatalf("got %d", c)
+	}
+	for _, c := range []struct {
+		mode string
+		want int
+	}{{"maint", 503}, {"block", 403}, {"on", 200}, {"maint", 503}} {
+		set(t, admin, "a.lan", c.mode, nil)
+		if got := get(); got != c.want {
+			t.Fatalf("right after set %s: got %d, want %d", c.mode, got, c.want)
+		}
+	}
+}
+
+func TestTemplateSelectAutoSubmitsInMaint(t *testing.T) {
+	tpls := []string{"downtime"}
+	if !strings.Contains(modeButtons("a.lan", modeMaint, "", tpls), `onchange="this.form.requestSubmit(this.form.querySelector('button.maint'))"`) {
+		t.Fatal("maint row: dropdown must apply at once")
+	}
+	if strings.Contains(modeButtons("a.lan", modeOn, "", tpls), "onchange") {
+		t.Fatal("on row: dropdown must only preselect")
+	}
+}
