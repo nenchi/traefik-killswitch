@@ -8,6 +8,7 @@ RUN=test/run
 rm -rf "$RUN" && mkdir -p "$RUN/plugins-local/src/github.com/nenchi/traefik-killswitch"
 cp go.mod .traefik.yml killswitch.go "$RUN/plugins-local/src/github.com/nenchi/traefik-killswitch/"
 STATE="$PWD/$RUN/state.json"
+mkdir -p "$RUN/pages" && echo "default-page" > "$RUN/pages/maintenance.html" && echo "downtime-page" > "$RUN/pages/downtime.html"
 
 cat > "$RUN/static.yml" <<YML
 entryPoints:
@@ -35,6 +36,7 @@ http:
       plugin:
         killswitch:
           stateFile: $STATE
+          maintenanceFile: $PWD/$RUN/pages/maintenance.html
           excludeHosts: [ks.lan]
     ks-admin:
       plugin:
@@ -69,7 +71,8 @@ trap 'kill $PID 2>/dev/null || true' EXIT
 code() { curl -s -o /dev/null -w '%{http_code}' -H "Host: $1" http://127.0.0.1:18080/; }
 # A switch applies within ~1s (state file is re-checked at most once a second): poll up to 3s for the wanted code.
 code_within() { local c; for _ in $(seq 15); do c=$(code "$1"); [ "$c" = "$2" ] && break; sleep 0.2; done; echo "$c"; }
-set_mode() { curl -s -o /dev/null -w '%{http_code}' -d "host=$1&mode=$2" http://127.0.0.1:18081/; }
+set_mode() { curl -s -o /dev/null -w '%{http_code}' -d "host=$1&mode=$2&template=${3:-}" http://127.0.0.1:18081/; }
+body_within() { local b; for _ in $(seq 15); do b=$(curl -s -H "Host: $1" http://127.0.0.1:18080/); [ "$b" = "$2" ] && break; sleep 0.2; done; echo "$b"; }
 expect() { [ "$2" = "$3" ] && echo "ok   $1" || { echo "FAIL $1: got $2, want $3"; cat "$RUN/traefik.log"; exit 1; }; }
 
 for _ in $(seq 50); do [ "$(code a.lan)" = 200 ] && break; sleep 0.2; done
@@ -79,6 +82,9 @@ expect "a passes"            "$(code_within a.lan 418)" 418
 expect "admin page"          "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/)" 200
 expect "set a=maint"         "$(set_mode a.lan maint)" 303
 expect "a maintenance"       "$(code_within a.lan 503)" 503
+expect "a default page"      "$(body_within a.lan default-page)" default-page
+expect "set a=maint:downtime" "$(set_mode a.lan maint downtime)" 303
+expect "a downtime page"     "$(body_within a.lan downtime-page)" downtime-page
 expect "b still passes"      "$(code_within b.lan 418)" 418
 expect "set *=block"         "$(set_mode '*' block)" 303
 expect "b blocked by global" "$(code_within b.lan 403)" 403

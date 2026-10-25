@@ -1,0 +1,57 @@
+<!doctype html>
+<!--
+  Example "unplanned downtime" template for traefik-killswitch. Put it next to your
+  maintenanceFile and pick it per site in the admin page (it shows up as "downtime"). Keep it self-contained: while a site is in maintenance
+  every request to it returns this page, so CSS, images or fonts hosted on that site won't load.
+  Inline everything (images as data: URIs or inline SVG). Edits apply immediately,
+  with no Traefik restart.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Temporarily unavailable</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5d6675; --accent: #c62828; --border: #e3e6eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1d2128; --text: #e8eaee; --muted: #a0a8b5; --accent: #ff6b6b; --border: #2c323b; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
+    background: var(--bg); color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main {
+    max-width: 34rem; width: 100%; text-align: center; padding: 2.5rem 2rem;
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+  }
+  svg { width: 56px; height: 56px; color: var(--accent); }
+  h1 { font-size: 1.6rem; margin: 1rem 0 .5rem; }
+  p { color: var(--muted); margin: .5rem 0; }
+  .eta { display: inline-block; margin-top: 1rem; padding: .35rem .9rem; border-radius: 999px;
+         background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--text); font-weight: 600; }
+  footer { margin-top: 1.5rem; font-size: .85rem; color: var(--muted); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <!-- warning icon, inline so it loads while the site is down -->
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>
+  </svg>
+  <h1>Temporarily unavailable</h1>
+  <p>This site has been taken offline while we look into a problem. Your data is safe, and we'll bring it back once it's resolved.</p>
+  <!-- Edit or delete the next line -->
+  <span class="eta">Status: investigating</span>
+  <footer>
+    <!-- Optional: link to a status page hosted elsewhere -->
+    Questions? Contact <a href="mailto:admin@example.com">admin@example.com</a>
+  </footer>
+</main>
+</body>
+</html>

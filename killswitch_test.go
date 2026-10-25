@@ -210,3 +210,80 @@ func TestAdminShowsExcludedHosts(t *testing.T) {
 	}
 	delete(excludedBy, "gate-excl")
 }
+
+func TestTemplates(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("maintenance.html", "default-page")
+	write("downtime.html", "downtime-page")
+	write("notes.txt", "not a template")
+	stateFile := filepath.Join(dir, "state.json")
+	gate, err := New(context.Background(), nil, &Config{StateFile: stateFile, MaintenanceFile: filepath.Join(dir, "maintenance.html")}, "gate-tpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { delete(maintFiles, "gate-tpl"); delete(excludedBy, "gate-tpl") }()
+	admin, err := New(context.Background(), nil, &Config{StateFile: stateFile, Admin: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := templates(); len(got) != 1 || got[0] != "downtime" {
+		t.Fatalf("templates() = %v, want [downtime]", got)
+	}
+	body := func(host string) string {
+		gate.(*KillSwitch).checked = time.Time{}
+		rec := httptest.NewRecorder()
+		gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil))
+		return rec.Body.String()
+	}
+	post := func(host, mode, tpl string) {
+		t.Helper()
+		form := url.Values{"host": {host}, "mode": {mode}, "template": {tpl}}.Encode()
+		req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		if loc := rec.Header().Get("Location"); strings.Contains(loc, "err=") {
+			t.Fatalf("post %s %s %s: %s", host, mode, tpl, loc)
+		}
+	}
+	post("a.lan", "maint", "")
+	if b := body("a.lan"); b != "default-page" {
+		t.Fatalf("default: got %q", b)
+	}
+	post("a.lan", "maint", "downtime")
+	if b := body("a.lan"); b != "downtime-page" {
+		t.Fatalf("template: got %q", b)
+	}
+	// old plain values and unknown templates still work
+	write("state.json", `{"a.lan":"maint","b.lan":"maint:gone","c.lan":"maint:../../etc/passwd"}`)
+	for _, h := range []string{"a.lan", "b.lan", "c.lan"} {
+		if b := body(h); b != "default-page" {
+			t.Fatalf("%s: got %q, want default page", h, b)
+		}
+	}
+	// global switch uses its own template
+	write("state.json", `{"*":"maint:downtime"}`)
+	if b := body("z.lan"); b != "downtime-page" {
+		t.Fatalf("global template: got %q", b)
+	}
+	// admin refuses an unknown template
+	form := url.Values{"host": {"a.lan"}, "mode": {"maint"}, "template": {"nope"}}.Encode()
+	req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Header().Get("Location"), "err=") {
+		t.Fatal("unknown template accepted")
+	}
+	page := httptest.NewRecorder()
+	admin.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
+	if !strings.Contains(page.Body.String(), `<option value="downtime"`) {
+		t.Fatal("admin page has no template select")
+	}
+}

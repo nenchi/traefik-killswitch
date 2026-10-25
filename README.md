@@ -103,13 +103,15 @@ Or add it to individual routers, e.g. with the Docker label
 | `stateFile`       | `/data/killswitch.json` | Shared JSON state. Must be writable for the admin instance.         |
 | `admin`           | `false`                 | Serve the web page instead of gating. Never forwards to a backend.  |
 | `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Edits apply immediately.   |
-| `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider.  |
+| `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider. Listed on the admin page as "Always on". |
 
 You can also edit the state file by hand or from a script:
 
 ```json
-{ "*": "on", "app.example.com": "maint", "old.example.com": "block" }
+{ "*": "on", "app.example.com": "maint", "api.example.com": "maint:downtime", "old.example.com": "block" }
 ```
+
+`maint:downtime` means maintenance mode with the `downtime` template (see below).
 
 ## Custom maintenance page
 
@@ -120,6 +122,22 @@ Start from [`examples/maintenance.html`](examples/maintenance.html): copy it nex
   page, including requests for its CSS, images and fonts. Inline your styles, and use inline SVG or `data:` URIs for images.
 - Edits apply immediately, with no restart. If the file is missing or unreadable, the built-in page
   is served and an error is logged, so a bad path can't break your sites.
+
+### Several pages: templates per site
+
+Every other `.html` file in the same directory as `maintenanceFile` is a template you can pick per site
+in the admin page. For example, add [`examples/downtime.html`](examples/downtime.html) for unplanned
+outages:
+
+```
+/data/maintenance.html   ← default page
+/data/downtime.html      ← shows up as "downtime"
+/data/planned-update.html
+```
+
+Each row on the admin page then gets a dropdown: pick a page and click **maint**. To switch a site that's
+already in maintenance to another page, pick it and click **maint** again. File names may contain only
+letters, digits, `-` and `_`. If a picked template is later deleted, the default page is served.
 
 ## Security
 
