@@ -176,6 +176,12 @@ Start from [`examples/maintenance.html`](examples/maintenance.html): copy it nex
 - Edits apply immediately, with no restart. If the file is missing or unreadable, the built-in page
   is served and an error is logged, so a bad path can't break your sites.
 
+### "Expected back" time
+
+Put `{{back|soon}}` anywhere in a page. During a scheduled window it's replaced with the window's end
+(`Sun 01 Nov 04:00 CET`, server time); when a site was switched by hand it shows the text after the `|`
+(`{{back}}` alone means "soon"). The example pages use it as `Expected back: {{back|soon}}`.
+
 ### Several pages: templates per site
 
 Every other `.html` file in the same directory as `maintenanceFile` is a template you can pick per site

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -136,7 +137,7 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Cache-Control", "no-store")
 		rw.Header().Set("Retry-After", strconv.Itoa(retry))
 		rw.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = rw.Write(k.maintPage(tpl))
+		_, _ = rw.Write(fillBack(k.maintPage(tpl), until))
 	case modeBlock:
 		http.Error(rw, "Forbidden", http.StatusForbidden)
 	default:
@@ -163,6 +164,23 @@ func (k *KillSwitch) maintPage(tpl string) []byte {
 		log.Printf("killswitch %s: %v (serving built-in page)", k.name, err)
 	}
 	return []byte(defaultMaintPage)
+}
+
+// backRe matches the {{back}} / {{back|fallback}} placeholder in maintenance pages.
+var backRe = regexp.MustCompile(`\{\{back(?:\|([^}]*))?\}\}`)
+
+// fillBack replaces {{back}} with the end of the running window ("Sun 01 Nov 04:00 CET"), or, when no end is
+// known (switched by hand), with the fallback text after "|" ("soon" if there is none).
+func fillBack(page []byte, until time.Time) []byte {
+	return backRe.ReplaceAllFunc(page, func(m []byte) []byte {
+		if !until.IsZero() {
+			return []byte(until.In(time.Local).Format(timeFmt + " MST"))
+		}
+		if sub := backRe.FindSubmatch(m); len(sub) > 1 && len(sub[1]) > 0 {
+			return sub[1]
+		}
+		return []byte("soon")
+	})
 }
 
 // modeFor returns the effective mode, template and, inside a scheduled window, its end.

@@ -8,7 +8,7 @@ RUN=test/run
 rm -rf "$RUN" && mkdir -p "$RUN/plugins-local/src/github.com/nenchi/traefik-killswitch"
 cp go.mod .traefik.yml killswitch.go "$RUN/plugins-local/src/github.com/nenchi/traefik-killswitch/"
 STATE="$PWD/$RUN/state.json"
-mkdir -p "$RUN/pages" && echo "default-page" > "$RUN/pages/maintenance.html" && echo "downtime-page" > "$RUN/pages/downtime.html"
+mkdir -p "$RUN/pages" && echo "default-page" > "$RUN/pages/maintenance.html" && echo "downtime-page" > "$RUN/pages/downtime.html" && echo "back: {{back|soon}}" > "$RUN/pages/back.html"
 
 cat > "$RUN/static.yml" <<YML
 entryPoints:
@@ -110,6 +110,14 @@ expect "b blocked by window" "$(code_within b.lan 403)" 403
 for _ in $(seq 15); do grep -q 'INF KILL-SWITCH: schedule active since' "$RUN/traefik.log" && break; sleep 0.2; done
 expect "cancel b window"     "$(post -d "host=b.lan&action=unschedule")" 303
 expect "b passes again"      "$(code_within b.lan 418)" 418
+expect "set b=maint:back"    "$(post -d "host=b.lan&mode=maint&template=back")" 303
+expect "manual maint says soon" "$(body_within b.lan 'back: soon')" "back: soon"
+FROM=$(date -d '-1 min' +%Y-%m-%dT%H:%M); TO=$(date -d '+1 hour' +%Y-%m-%dT%H:%M); WANT="back: $(date -d "$TO" '+%a %d %b %H:%M %Z')"
+expect "schedule b maint:back" "$(post -d "host=b.lan&action=schedule&mode=maint&template=back&from=$FROM&to=$TO")" 303
+expect "window shows its end" "$(body_within b.lan "$WANT")" "$WANT"
+expect "set b=on"            "$(post -d "host=b.lan&mode=on")" 303
+expect "cancel b window again" "$(post -d "host=b.lan&action=unschedule")" 303
+expect "b passes after cancel" "$(code_within b.lan 418)" 418
 FROM=$(date -d '+1 hour' +%Y-%m-%dT%H:%M); TO=$(date -d '+2 hour' +%Y-%m-%dT%H:%M)
 expect "schedule b later"    "$(post -d "host=b.lan&action=schedule&mode=maint&from=$FROM&to=$TO")" 303
 expect "b passes before window" "$(code_within b.lan 418)" 418

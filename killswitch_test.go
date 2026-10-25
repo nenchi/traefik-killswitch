@@ -733,3 +733,58 @@ func TestActorPrefersBasicAuth(t *testing.T) {
 		t.Fatalf("SSO user: got %q, want bobx (pipe stripped)", user)
 	}
 }
+
+func TestFillBack(t *testing.T) {
+	end := time.Date(2026, 11, 1, 4, 0, 0, 0, time.Local)
+	for _, c := range []struct {
+		page  string
+		until time.Time
+		want  string
+	}{
+		{"Expected back: {{back|soon}}", time.Time{}, "Expected back: soon"},
+		{"Expected back: {{back}}", time.Time{}, "Expected back: soon"},
+		{"Zurück: {{back|bald}}", time.Time{}, "Zurück: bald"},
+		{"Expected back: {{back|soon}}", end, "Expected back: " + end.Format(timeFmt+" MST")},
+		{"{{back}} / {{back|x}}", end, end.Format(timeFmt+" MST") + " / " + end.Format(timeFmt+" MST")},
+		{"no placeholder {{other}}", end, "no placeholder {{other}}"},
+	} {
+		if got := string(fillBack([]byte(c.page), c.until)); got != c.want {
+			t.Errorf("%q until=%v: got %q, want %q", c.page, !c.until.IsZero(), got, c.want)
+		}
+	}
+}
+
+func TestMaintPageShowsWindowEnd(t *testing.T) {
+	dir := t.TempDir()
+	page := filepath.Join(dir, "maintenance.html")
+	if err := os.WriteFile(page, []byte("back: {{back|soon}}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stateFile := filepath.Join(dir, "state.json")
+	end := time.Now().Add(time.Hour).Truncate(time.Second)
+	e := entry{mode: "on", sMode: "maint", from: time.Now().Add(-time.Minute).Truncate(time.Second), to: end}
+	if err := os.WriteFile(stateFile, []byte(`{"w.lan":"`+e.String()+`","m.lan":"maint"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := New(context.Background(), nil, &Config{StateFile: stateFile, MaintenanceFile: page}, "gate-back")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		seenMu.Lock()
+		delete(excludedBy, "gate-back")
+		delete(maintFiles, "gate-back")
+		seenMu.Unlock()
+	}()
+	get := func(host string) string {
+		rec := httptest.NewRecorder()
+		gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil))
+		return rec.Body.String()
+	}
+	if b := get("w.lan"); b != "back: "+end.Format(timeFmt+" MST") {
+		t.Fatalf("scheduled window: got %q", b)
+	}
+	if b := get("m.lan"); b != "back: soon" {
+		t.Fatalf("manual maint: got %q", b)
+	}
+}
