@@ -34,9 +34,10 @@ const defaultMaintPage = `<!doctype html><meta charset="utf-8"><meta name="viewp
 
 // Config is the plugin configuration.
 type Config struct {
-	StateFile       string `json:"stateFile,omitempty"`
-	Admin           bool   `json:"admin,omitempty"`
-	MaintenanceFile string `json:"maintenanceFile,omitempty"`
+	StateFile       string   `json:"stateFile,omitempty"`
+	Admin           bool     `json:"admin,omitempty"`
+	MaintenanceFile string   `json:"maintenanceFile,omitempty"`
+	ExcludeHosts    []string `json:"excludeHosts,omitempty"`
 }
 
 // CreateConfig returns the default configuration.
@@ -57,6 +58,7 @@ type KillSwitch struct {
 	stateFile string
 	admin     bool
 	maintPage []byte
+	exclude   map[string]bool
 
 	mu      sync.Mutex
 	state   map[string]string
@@ -78,7 +80,11 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		}
 		page = b
 	}
-	return &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintPage: page}, nil
+	exclude := map[string]bool{}
+	for _, h := range config.ExcludeHosts {
+		exclude[strings.ToLower(strings.TrimSpace(h))] = true
+	}
+	return &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintPage: page, exclude: exclude}, nil
 }
 
 func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -87,6 +93,11 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	host := hostOnly(req.Host)
+	// Excluded hosts (the admin page, the auth provider) are never gated, so "*" can't lock you out.
+	if k.exclude[host] {
+		k.next.ServeHTTP(rw, req)
+		return
+	}
 	seenMu.Lock()
 	seen[host] = true
 	seenMu.Unlock()

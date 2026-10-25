@@ -66,6 +66,9 @@ http:
         killswitch:
           stateFile: /data/killswitch.json
           # maintenanceFile: /data/maintenance.html   # optional custom page
+          excludeHosts:                 # never gated, so "*" can't lock you out
+            - killswitch.example.com
+            - auth.example.com          # your SSO login page, if it's on the same entry point
     killswitch-admin:
       plugin:
         killswitch:
@@ -75,7 +78,7 @@ http:
   routers:
     killswitch-admin:
       rule: Host(`killswitch.example.com`)
-      entryPoints: [admin]          # NOT an entry point gated by the kill switch
+      entryPoints: [websecure]      # fine when its host is in excludeHosts
       middlewares: [your-auth, killswitch-admin]
       service: noop@internal
 ```
@@ -100,6 +103,7 @@ Or add it to individual routers, e.g. with the Docker label
 | `stateFile`       | `/data/killswitch.json` | Shared JSON state. Must be writable for the admin instance.         |
 | `admin`           | `false`                 | Serve the web page instead of gating. Never forwards to a backend.  |
 | `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Read once at startup.       |
+| `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider.  |
 
 You can also edit the state file by hand or from a script:
 
@@ -111,8 +115,9 @@ You can also edit the state file by hand or from a script:
 
 - **Put authentication in front of the admin router** (forwardAuth, Authelia, Authentik, basicAuth, an IP
   allowlist). Anyone who can reach the page can take your sites down.
-- Keep the admin router off any entry point the kill switch gates. Otherwise setting `*` to `block`
-  locks you out of the switch, and you'd have to edit the file by hand.
+- If the admin page or your SSO login runs on an entry point the kill switch gates, put their hosts in
+  `excludeHosts`. Otherwise setting `*` to `block` locks you out of the switch, and you'd have to
+  edit the file by hand.
 - Cross-site form posts are rejected (`Origin` / `Sec-Fetch-Site` checks).
 
 ## Limitations

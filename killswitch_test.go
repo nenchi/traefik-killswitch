@@ -144,3 +144,21 @@ func TestCustomMaintenancePage(t *testing.T) {
 		t.Fatal("missing maintenanceFile should fail at startup")
 	}
 }
+
+func TestExcludeHosts(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(stateFile, []byte(`{"*":"block"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {})
+	gate, err := New(context.Background(), next, &Config{StateFile: stateFile, ExcludeHosts: []string{" Auth.LAN "}}, "gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := hit(gate, "auth.lan:443"); c != 200 {
+		t.Fatalf("excluded host: got %d, want 200", c)
+	}
+	if c := hit(gate, "a.lan"); c != 403 {
+		t.Fatalf("other host: got %d, want 403", c)
+	}
+}

@@ -35,6 +35,7 @@ http:
       plugin:
         killswitch:
           stateFile: $STATE
+          excludeHosts: [ks.lan]
     ks-admin:
       plugin:
         killswitch:
@@ -48,6 +49,11 @@ http:
     b:
       entryPoints: [web]
       rule: Host(\`b.lan\`)
+      service: noop@internal
+    admin-gated-ep:
+      entryPoints: [web]
+      rule: Host(\`ks.lan\`)
+      middlewares: [ks-admin]
       service: noop@internal
     admin:
       entryPoints: [admin]
@@ -77,6 +83,7 @@ expect "b still passes"      "$(code_within b.lan 418)" 418
 expect "set *=block"         "$(set_mode '*' block)" 303
 expect "b blocked by global" "$(code_within b.lan 403)" 403
 expect "admin not gated"     "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/)" 200
+expect "excluded host passes" "$(code_within ks.lan 200)" 200
 expect "set *=on"            "$(set_mode '*' on)" 303
 expect "a back to maint"     "$(code_within a.lan 503)" 503
 expect "set a=on"            "$(set_mode a.lan on)" 303
