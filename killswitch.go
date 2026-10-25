@@ -47,8 +47,11 @@ func CreateConfig() *Config {
 
 // ponytail: package-level, shared by all instances in Traefik's interpreter; lost on restart.
 var (
-	seenMu sync.Mutex
+	seenMu sync.Mutex // guards seen and excludedBy
 	seen   = map[string]bool{}
+	// excludedBy holds each gate middleware's excludeHosts, keyed by middleware name, so the admin
+	// page (a separate instance with its own config) can show which hosts are never switched off.
+	excludedBy = map[string][]string{}
 )
 
 // KillSwitch is the middleware.
@@ -73,8 +76,16 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		return nil, fmt.Errorf("stateFile must be set")
 	}
 	exclude := map[string]bool{}
+	list := []string{}
 	for _, h := range config.ExcludeHosts {
-		exclude[strings.ToLower(strings.TrimSpace(h))] = true
+		h = strings.ToLower(strings.TrimSpace(h))
+		exclude[h] = true
+		list = append(list, h)
+	}
+	if !config.Admin {
+		seenMu.Lock()
+		excludedBy[name] = list
+		seenMu.Unlock()
 	}
 	return &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile, exclude: exclude}, nil
 }
@@ -236,6 +247,10 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 		target := req.URL.Path
+		if excludedHosts()[host] {
+			http.Redirect(rw, req, target+"?err="+url.QueryEscape(host+" is in excludeHosts and is never switched off"), http.StatusSeeOther)
+			return
+		}
 		if err := k.setMode(host, mode); err != nil {
 			log.Printf("killswitch %s: saving state: %v", k.name, err)
 			target += "?err=" + url.QueryEscape(err.Error())
@@ -259,8 +274,62 @@ func sameOrigin(req *http.Request) bool {
 	return err == nil && strings.EqualFold(u.Host, req.Host)
 }
 
+// excludedHosts returns the union of every gate middleware's excludeHosts.
+func excludedHosts() map[string]bool {
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	all := map[string]bool{}
+	for _, list := range excludedBy {
+		for _, h := range list {
+			all[h] = true
+		}
+	}
+	return all
+}
+
+const adminStyle = `<style>
+:root{color-scheme:light dark;--bg:#f5f6f8;--card:#fff;--text:#1d2330;--muted:#5d6675;--border:#e1e4e9;
+--on:#1a7f37;--maint:#b35900;--block:#c62828;--btn:#eef0f3;--btn-text:#1d2330;--err:#fde7e7}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--text:#e8eaee;--muted:#9aa3b0;--border:#2c323b;
+--on:#3fb950;--maint:#f0a04b;--block:#ff6b6b;--btn:#2a3039;--btn-text:#e8eaee;--err:#4a1f22}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:52rem;margin:0 auto;padding:1.5rem 16px 3rem}
+h1{font-size:1.5rem;margin:0 0 .25rem}h2{font-size:1.05rem;margin:2rem 0 .5rem}
+p{color:var(--muted);margin:.25rem 0 1rem}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1rem;padding:.7rem 1rem;border-top:1px solid var(--border)}
+.row:first-child{border-top:0}.row.all{background:color-mix(in srgb,var(--text) 4%,transparent)}
+.host{flex:1 1 14rem;font-weight:600;overflow-wrap:anywhere}.host small{display:block;font-weight:400;color:var(--muted)}
+.pill{font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:.15rem .6rem;border-radius:999px;
+color:var(--c);background:color-mix(in srgb,var(--c) 14%,transparent)}
+.on{--c:var(--on)}.maint{--c:var(--maint)}.block{--c:var(--block)}
+form{display:flex;gap:.35rem;margin:0}
+button{font:inherit;padding:.3rem .8rem;border-radius:8px;border:1px solid var(--border);background:var(--btn);color:var(--btn-text);cursor:pointer}
+button:hover:not([disabled]){border-color:var(--c)}
+button[disabled]{cursor:default;color:#fff;background:var(--c);border-color:var(--c)}
+input{font:inherit;padding:.3rem .6rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);flex:1 1 14rem}
+.err{background:var(--err);border-radius:8px;padding:.6rem 1rem;color:var(--text)}
+ul.excl{margin:0;padding:.6rem 1rem .6rem 2rem;color:var(--muted)}
+</style>`
+
+func modeButtons(host, cur string) string {
+	var b strings.Builder
+	b.WriteString(`<form method="post"><input type="hidden" name="host" value="` + html.EscapeString(host) + `">`)
+	for _, m := range []string{modeOn, modeMaint, modeBlock} {
+		dis := ""
+		if m == cur {
+			dis = " disabled"
+		}
+		b.WriteString(`<button class="` + m + `" name="mode" value="` + m + `"` + dis + `>` + m + `</button>`)
+	}
+	b.WriteString(`</form>`)
+	return b.String()
+}
+
 func (k *KillSwitch) renderAdmin(errMsg string) string {
 	state := k.load()
+	excluded := excludedHosts()
 	hosts := map[string]bool{}
 	for h := range state {
 		hosts[h] = true
@@ -271,48 +340,57 @@ func (k *KillSwitch) renderAdmin(errMsg string) string {
 	}
 	seenMu.Unlock()
 	delete(hosts, allHosts)
-	list := make([]string, 0, len(hosts))
+	list := []string{}
 	for h := range hosts {
-		list = append(list, h)
+		if !excluded[h] {
+			list = append(list, h)
+		}
 	}
 	sort.Strings(list)
-	list = append([]string{allHosts}, list...)
+	exList := []string{}
+	for h := range excluded {
+		exList = append(exList, h)
+	}
+	sort.Strings(exList)
+
+	mode := func(h string) string {
+		if m := state[h]; m != "" {
+			return m
+		}
+		return modeOn
+	}
 
 	var b strings.Builder
-	b.WriteString(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Kill switch</title><style>
-body{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem}
-table{border-collapse:collapse;width:100%}td{padding:.5rem;border-bottom:1px solid #ccc}
-button{padding:.35rem .8rem;margin-right:.25rem;cursor:pointer}button[disabled]{font-weight:bold}
-.on{color:#080}.maint{color:#b60}.block{color:#c00}.err{background:#fdd;padding:.5rem}
-</style><h1>Kill switch</h1>`)
+	b.WriteString(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kill switch</title>` + adminStyle + `<main><h1>Kill switch</h1>
+<p><b>on</b> serves the site, <b>maint</b> shows the maintenance page (503), <b>block</b> refuses every request (403).</p>`)
 	if errMsg != "" {
-		b.WriteString(`<p class="err">Save failed: ` + html.EscapeString(errMsg) + `</p>`)
+		b.WriteString(`<p class="err">` + html.EscapeString(errMsg) + `</p>`)
 	}
-	b.WriteString(`<p><b>*</b> switches every site and overrides the per-host setting.</p><table>`)
+	g := mode(allHosts)
+	b.WriteString(`<div class="card"><div class="row all"><div class="host">All sites<small>Overrides every per-site setting while not "on"`)
+	if len(exList) > 0 {
+		b.WriteString(`, except the always-on hosts below`)
+	}
+	b.WriteString(`</small></div><span class="pill ` + g + `">` + g + `</span>` + modeButtons(allHosts, g) + `</div>`)
 	for _, h := range list {
-		cur := state[h]
-		if cur == "" {
-			cur = modeOn
-		}
-		eh := html.EscapeString(h)
-		label := eh
-		if h == allHosts {
-			label = "* (all sites)"
-		}
-		b.WriteString(`<tr><td>` + label + `</td><td class="` + cur + `">` + cur + `</td><td><form method="post">` +
-			`<input type="hidden" name="host" value="` + eh + `">`)
-		for _, m := range []string{modeOn, modeMaint, modeBlock} {
-			dis := ""
-			if m == cur {
-				dis = " disabled"
-			}
-			b.WriteString(`<button name="mode" value="` + m + `"` + dis + `>` + m + `</button>`)
-		}
-		b.WriteString(`</form></td></tr>`)
+		m := mode(h)
+		b.WriteString(`<div class="row"><div class="host">` + html.EscapeString(h) + `</div><span class="pill ` + m + `">` + m + `</span>` + modeButtons(h, m) + `</div>`)
 	}
-	b.WriteString(`</table><h2>Add host</h2><form method="post"><input name="host" placeholder="app.example.com" required> ` +
-		`<button name="mode" value="maint">maint</button><button name="mode" value="block">block</button></form>`)
+	if len(list) == 0 {
+		b.WriteString(`<div class="row"><p>No sites seen yet. They appear after their first request, or add one below.</p></div>`)
+	}
+	b.WriteString(`</div>`)
+	if len(exList) > 0 {
+		b.WriteString(`<h2>Always on</h2><p>Listed in <code>excludeHosts</code>: never switched off, not even by "All sites".</p><div class="card"><ul class="excl">`)
+		for _, h := range exList {
+			b.WriteString(`<li>` + html.EscapeString(h) + `</li>`)
+		}
+		b.WriteString(`</ul></div>`)
+	}
+	b.WriteString(`<h2>Add site</h2><div class="card"><div class="row"><form method="post" style="flex:1;flex-wrap:wrap">` +
+		`<input name="host" placeholder="app.example.com" required><button class="maint" name="mode" value="maint">maint</button>` +
+		`<button class="block" name="mode" value="block">block</button></form></div></div></main></html>`)
 	return b.String()
 }
 

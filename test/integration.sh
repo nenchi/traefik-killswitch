@@ -88,5 +88,7 @@ expect "set *=on"            "$(set_mode '*' on)" 303
 expect "a back to maint"     "$(code_within a.lan 503)" 503
 expect "set a=on"            "$(set_mode a.lan on)" 303
 expect "a passes again"      "$(code_within a.lan 418)" 418
-curl -s http://127.0.0.1:18081/ | grep -q 'b.lan' && echo "ok   admin lists seen host b.lan" || echo "note admin did not list seen host (globals not shared)"
+PAGE=$(curl -s http://127.0.0.1:18081/)
+echo "$PAGE" | grep -q 'value="b.lan"' && echo "ok   admin lists seen host b.lan" || { echo "FAIL admin does not list seen host"; exit 1; }
+echo "$PAGE" | grep -q '<li>ks.lan</li>' && echo "ok   admin lists excluded host ks.lan as always on" || { echo "FAIL excluded host not shown"; exit 1; }
 cat "$STATE"; echo

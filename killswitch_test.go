@@ -175,3 +175,38 @@ func TestExcludeHosts(t *testing.T) {
 		t.Fatalf("other host: got %d, want 403", c)
 	}
 }
+
+func TestAdminShowsExcludedHosts(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {})
+	gate, err := New(context.Background(), next, &Config{StateFile: stateFile, ExcludeHosts: []string{"auth.lan"}}, "gate-excl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hit(gate, "auth.lan")
+	hit(gate, "app.lan")
+	admin, err := New(context.Background(), next, &Config{StateFile: stateFile, Admin: true}, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
+	body := rec.Body.String()
+	alwaysOn := strings.Index(body, "Always on")
+	if alwaysOn < 0 || !strings.Contains(body[alwaysOn:], "<li>auth.lan</li>") {
+		t.Fatal("excluded host not listed under Always on")
+	}
+	if strings.Contains(body, `name="host" value="auth.lan"`) {
+		t.Fatal("excluded host must not get switch buttons")
+	}
+	if !strings.Contains(body, `name="host" value="app.lan"`) {
+		t.Fatal("normal host missing")
+	}
+	if c := set(t, admin, "auth.lan", "block", nil); c != http.StatusSeeOther {
+		t.Fatalf("got %d", c)
+	}
+	if _, err := os.Stat(stateFile); err == nil {
+		t.Fatal("switching an excluded host must not write state")
+	}
+	delete(excludedBy, "gate-excl")
+}
