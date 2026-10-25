@@ -48,6 +48,11 @@ http:
           stateFile: $STATE
           admin: true
           apiURL: http://127.0.0.1:18082
+  services:
+    msvc:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:9
   routers:
     a:
       entryPoints: [web]
@@ -57,6 +62,14 @@ http:
       entryPoints: [web]
       rule: Host(\`b.lan\`)
       service: noop@internal
+    multi:
+      entryPoints: [web]
+      rule: Host(\`m1.test.lan\`) || Host(\`m2.test.lan\`)
+      service: msvc
+    multi-other-domain:
+      entryPoints: [web]
+      rule: Host(\`m3.other.lan\`)
+      service: msvc
     admin-gated-ep:
       entryPoints: [web]
       rule: Host(\`ks.lan\`)
@@ -142,6 +155,14 @@ PY
 for _ in $(seq 15); do grep -q old.lan "$STATE" || break; sleep 0.2; done
 grep -q old.lan "$STATE" && { echo "FAIL ended window not removed"; exit 1; } || echo "ok   ended window removed automatically"
 curl -s 'http://127.0.0.1:18081/?view=history' | grep -q 'schedule for old.lan' && echo "ok   history page shows removal" || { echo "FAIL history page"; exit 1; }
+curl -s http://127.0.0.1:18081/ | grep -q '>m1.test.lan + m2.test.lan<' && echo "ok   one service + domain form one row" || { echo "FAIL m1+m2 not grouped"; exit 1; }
+curl -s http://127.0.0.1:18081/ | grep -q '>m3.other.lan<' && echo "ok   same service, other domain stays apart" || { echo "FAIL m3 not separate"; exit 1; }
+expect "switch group"        "$(post -d 'host=m1.test.lan&host=m2.test.lan&mode=block')" 303
+expect "m1 blocked"          "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: m1.test.lan' http://127.0.0.1:18080/)" 403
+expect "m2 blocked"          "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: m2.test.lan' http://127.0.0.1:18080/)" 403
+expect "m3 untouched"        "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: m3.other.lan' http://127.0.0.1:18080/)" 502
+expect "group back on"       "$(post -d 'host=m1.test.lan&host=m2.test.lan&mode=on')" 303
+curl -s -b 'ks_group=off' http://127.0.0.1:18081/ | grep -q 'm1.test.lan + m2.test.lan' && { echo "FAIL grouping off still groups"; exit 1; } || echo "ok   grouping off lists names separately"
 PAGE=$(curl -s http://127.0.0.1:18081/)
 echo "$PAGE" | grep -q '<li>c.lan <small>(unprotected@file)' && echo "ok   admin lists c.lan as not protected" || { echo "FAIL c.lan not listed as unprotected"; exit 1; }
 echo "$PAGE" | grep -q '(upcoming)' && echo "ok   admin shows upcoming window" || { echo "FAIL upcoming window not shown"; exit 1; }

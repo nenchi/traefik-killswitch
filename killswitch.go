@@ -683,6 +683,7 @@ func (k *KillSwitch) update(host string, fn func(e *entry)) error {
 type route struct {
 	routers     []string
 	unprotected []string
+	services    []string // Traefik services (containers) behind those routers, "media@docker"
 }
 
 func (r route) protected() bool { return len(r.unprotected) == 0 }
@@ -692,6 +693,7 @@ type apiRouter struct {
 	Rule        string   `json:"rule"`
 	Status      string   `json:"status"`
 	Middlewares []string `json:"middlewares"`
+	Service     string   `json:"service"`
 }
 
 type apiMiddleware struct {
@@ -796,9 +798,16 @@ func fetchRoutes(base string) (map[string]route, error) {
 				gated = true
 			}
 		}
+		service := r.Service
+		if i := strings.LastIndex(r.Name, "@"); i >= 0 && service != "" && !strings.Contains(service, "@") {
+			service += r.Name[i:] // services are relative to the router's provider
+		}
 		for _, h := range hostsFromRule(r.Rule) {
 			rt := routes[h]
 			rt.routers = append(rt.routers, r.Name)
+			if service != "" && !contains(rt.services, service) {
+				rt.services = append(rt.services, service)
+			}
 			if !gated {
 				rt.unprotected = append(rt.unprotected, r.Name)
 			}
@@ -895,7 +904,17 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			_, _ = rw.Write([]byte(k.renderHistory()))
 			return
 		}
-		_, _ = rw.Write([]byte(k.renderAdmin(req.URL.Query().Get("err"), req.URL.Query().Get("warn"))))
+		// ?group=on|off toggles grouping by router; the choice is kept in a cookie for this browser.
+		if g := req.URL.Query().Get("group"); g == "on" || g == "off" {
+			http.SetCookie(rw, &http.Cookie{Name: "ks_group", Value: g, Path: "/", MaxAge: 365 * 24 * 3600, SameSite: http.SameSiteLaxMode})
+			http.Redirect(rw, req, req.URL.Path, http.StatusSeeOther)
+			return
+		}
+		grouped := true
+		if c, err := req.Cookie("ks_group"); err == nil && c.Value == "off" {
+			grouped = false
+		}
+		_, _ = rw.Write([]byte(k.renderAdmin(req.URL.Query().Get("err"), req.URL.Query().Get("warn"), grouped)))
 	case http.MethodPost:
 		if !sameOrigin(req) {
 			http.Error(rw, "cross-origin request refused", http.StatusForbidden)
@@ -905,10 +924,16 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
-		host := strings.ToLower(strings.TrimSpace(req.PostForm.Get("host")))
+		// A group row (names of one service and domain) posts one "host" field per name.
+		hosts := []string{}
+		for _, h := range req.PostForm["host"] {
+			if h = strings.ToLower(strings.TrimSpace(h)); h != "" && !contains(hosts, h) {
+				hosts = append(hosts, h)
+			}
+		}
 		mode := req.PostForm.Get("mode")
 		action := req.PostForm.Get("action")
-		if host == "" || (action != "unschedule" && mode != modeOn && mode != modeMaint && mode != modeBlock) {
+		if len(hosts) == 0 || (action != "unschedule" && mode != modeOn && mode != modeMaint && mode != modeBlock) {
 			http.Error(rw, "invalid host or mode", http.StatusBadRequest)
 			return
 		}
@@ -920,14 +945,21 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			fail("unknown template " + tpl)
 			return
 		}
-		if excludedHosts()[host] {
-			fail(host + " is in excludeHosts and is never switched off")
-			return
-		}
-		refuse, warn := k.checkHost(host, mode, action)
-		if refuse != "" {
-			fail(refuse)
-			return
+		// Check every name first, so a group is switched completely or not at all.
+		warns := []string{}
+		for _, host := range hosts {
+			if excludedHosts()[host] {
+				fail(host + " is in excludeHosts and is never switched off")
+				return
+			}
+			refuse, warn := k.checkHost(host, mode, action)
+			if refuse != "" {
+				fail(refuse)
+				return
+			}
+			if warn != "" {
+				warns = append(warns, warn)
+			}
 		}
 		user, ip := actor(req)
 		who := " from " + ip
@@ -935,7 +967,7 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			who = " by " + user + who
 		}
 		var fn func(e *entry)
-		var msg string
+		var msg string // "%s" is the host
 		switch action {
 		case "schedule":
 			from, err1 := time.ParseInLocation("2006-01-02T15:04", req.PostForm.Get("from"), time.Local)
@@ -973,26 +1005,28 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 				e.repeat = repeat
 			}
 			planned := entry{from: from, to: to, repeat: repeat}
-			msg = "schedule created for " + hostLabel(host) + ": " + modeLabel(mode, tpl) + " " + planned.when() + who
+			msg = "schedule created for %s: " + modeLabel(mode, tpl) + " " + planned.when() + who
 		case "unschedule":
 			fn = func(e *entry) { e.to = time.Time{} }
-			msg = "schedule cancelled for " + hostLabel(host) + who
+			msg = "schedule cancelled for %s" + who
 		default:
 			fn = func(e *entry) {
 				e.mode = mode
 				e.tpl = tpl
 			}
-			msg = hostLabel(host) + " set to " + modeLabel(mode, tpl) + who
+			msg = "%s set to " + modeLabel(mode, tpl) + who
 		}
-		if err := k.update(host, fn); err != nil {
-			log.Printf("killswitch %s: saving state: %v", k.name, err)
-			fail("Save failed: " + err.Error())
-			return
+		for _, host := range hosts {
+			if err := k.update(host, fn); err != nil {
+				log.Printf("killswitch %s: saving state: %v", k.name, err)
+				fail("Save failed for " + host + ": " + err.Error())
+				return
+			}
+			k.record(msg, hostLabel(host))
 		}
-		k.record("%s", msg)
 		target := req.URL.Path
-		if warn != "" {
-			target += "?warn=" + url.QueryEscape(warn)
+		if len(warns) > 0 {
+			target += "?warn=" + url.QueryEscape(strings.Join(warns, " "))
 		}
 		http.Redirect(rw, req, target, http.StatusSeeOther)
 	default:
@@ -1054,7 +1088,7 @@ p{color:var(--muted);margin:.25rem 0 1rem}
 .host{flex:1 1 14rem;font-weight:600;overflow-wrap:anywhere}.host small{display:block;font-weight:400;color:var(--muted)}
 .pill{font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:.15rem .6rem;border-radius:999px;
 color:var(--c);background:color-mix(in srgb,var(--c) 14%,transparent)}
-.on{--c:var(--on)}.maint{--c:var(--maint)}.block{--c:var(--block)}
+.on{--c:var(--on)}.maint{--c:var(--maint)}.block{--c:var(--block)}.mixed{--c:var(--muted)}
 form{display:flex;gap:.35rem;margin:0}
 button{font:inherit;padding:.3rem .8rem;border-radius:8px;border:1px solid var(--border);background:var(--btn);color:var(--btn-text);cursor:pointer}
 button:hover:not([disabled]){border-color:var(--c)}
@@ -1075,10 +1109,19 @@ details form{flex-wrap:wrap;align-items:center;margin-top:.5rem}details label{di
 details input{flex:0 1 auto}
 </style>`
 
-// modeButtons renders the per-host form; with templates, a select picks the page "maint" will show.
-func modeButtons(host, cur, curTpl string, tpls []string) string {
+// hostFields renders one hidden "host" input per name, so a form switches a whole group.
+func hostFields(hosts []string) string {
 	var b strings.Builder
-	b.WriteString(`<form method="post"><input type="hidden" name="host" value="` + html.EscapeString(host) + `">`)
+	for _, h := range hosts {
+		b.WriteString(`<input type="hidden" name="host" value="` + html.EscapeString(h) + `">`)
+	}
+	return b.String()
+}
+
+// modeButtons renders the form for one row; with templates, a select picks the page "maint" will show.
+func modeButtons(hosts []string, cur, curTpl string, tpls []string) string {
+	var b strings.Builder
+	b.WriteString(`<form method="post">` + hostFields(hosts))
 	sel := templateSelect(tpls, curTpl)
 	if cur == modeMaint {
 		// In maint, picking another page applies it at once (submits the row as "maint").
@@ -1115,10 +1158,10 @@ func templateSelect(tpls []string, cur string) string {
 
 const timeFmt = "Mon 02 Jan 15:04"
 
-// scheduleHTML shows a host's window with a Cancel button, and a form to plan a new one.
-func scheduleHTML(host string, e entry, tpls []string) string {
+// scheduleHTML shows a row's window with a Cancel button, and a form to plan a new one.
+func scheduleHTML(hosts []string, e entry, tpls []string) string {
 	var b strings.Builder
-	eh := html.EscapeString(host)
+	fields := hostFields(hosts)
 	t := now()
 	if e.scheduled() && !e.ended(t) {
 		s, end := e.window(t)
@@ -1134,9 +1177,9 @@ func scheduleHTML(host string, e entry, tpls []string) string {
 		}
 		b.WriteString(`<div class="sched">Scheduled <span class="pill ` + e.sMode + `">` + html.EscapeString(label) + `</span> <b>` +
 			html.EscapeString(e.when()) + `</b> (` + state + `)` + html.EscapeString(e.createdLabel()) +
-			`<form method="post"><input type="hidden" name="host" value="` + eh + `"><button name="action" value="unschedule">Cancel</button></form></div>`)
+			`<form method="post">` + fields + `<button name="action" value="unschedule">Cancel</button></form></div>`)
 	}
-	b.WriteString(`<details><summary>Schedule…</summary><form method="post"><input type="hidden" name="host" value="` + eh + `">` +
+	b.WriteString(`<details><summary>Schedule…</summary><form method="post">` + fields +
 		`<input type="hidden" name="action" value="schedule"><select name="mode" aria-label="Scheduled mode"><option value="maint">maint</option><option value="block">block</option></select>` +
 		templateSelect(tpls, "") +
 		`<label>from <input type="datetime-local" name="from" required></label><label>to <input type="datetime-local" name="to" required></label>` +
@@ -1169,7 +1212,68 @@ func (k *KillSwitch) renderHistory() string {
 	return b.String()
 }
 
-func (k *KillSwitch) renderAdmin(errMsg, warnMsg string) string {
+// groupToggle links to the other grouping view; grouping needs router data (apiURL).
+func groupToggle(grouped, haveRoutes bool) string {
+	if !haveRoutes {
+		return ""
+	}
+	if grouped {
+		return `Group by service: <b>on</b> · <a href="?group=off">off</a> &nbsp;|&nbsp; `
+	}
+	return `Group by service: <a href="?group=on">on</a> · <b>off</b> &nbsp;|&nbsp; `
+}
+
+// baseDomain is the last two labels of a host: media.example.com -> example.com, media.home.arpa -> home.arpa.
+func baseDomain(host string) string {
+	parts := strings.Split(host, ".")
+	if len(parts) <= 2 {
+		return host
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+// groupHosts puts names served by the same Traefik service (container) under the same domain into one row:
+// media.example.com + m.example.com, while media.home.arpa stays apart. Without router data every name is its own row.
+func groupHosts(list []string, routes map[string]route) [][]string {
+	parent := map[string]string{}
+	var find func(h string) string
+	find = func(h string) string {
+		for parent[h] != h {
+			h = parent[h]
+		}
+		return h
+	}
+	for _, h := range list {
+		parent[h] = h
+	}
+	byKey := map[string]string{} // service|domain -> first listed host with it
+	for _, h := range list {
+		for _, svc := range routes[h].services {
+			key := svc + "|" + baseDomain(h)
+			if first, ok := byKey[key]; ok {
+				parent[find(h)] = find(first)
+			} else {
+				byKey[key] = h
+			}
+		}
+	}
+	groups := map[string][]string{}
+	order := []string{}
+	for _, h := range list { // list is sorted, so groups and their names come out sorted
+		root := find(h)
+		if _, ok := groups[root]; !ok {
+			order = append(order, root)
+		}
+		groups[root] = append(groups[root], h)
+	}
+	out := [][]string{}
+	for _, root := range order {
+		out = append(out, groups[root])
+	}
+	return out
+}
+
+func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	state := k.load()
 	excluded := excludedHosts()
 	routes, apiErr := k.hostRoutes()
@@ -1220,7 +1324,7 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string) string {
 
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kill switch</title>` + adminStyle + `<main><div class="top"><h1>Kill switch</h1><a href="?view=history">History</a></div>
+<title>Kill switch</title>` + adminStyle + `<main><div class="top"><h1>Kill switch</h1><span>` + groupToggle(grouped, routes != nil) + `<a href="?view=history">History</a></span></div>
 <p><b>on</b> serves the site, <b>maint</b> shows the maintenance page (503), <b>block</b> refuses every request (403).</p>`)
 	if len(tpls) > 0 {
 		b.WriteString(`<p>Pick a page in the list, then click <b>maint</b>. While a site is in maint, picking another page switches it right away.</p>`)
@@ -1241,19 +1345,56 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string) string {
 	if len(exList) > 0 {
 		b.WriteString(`, except the always-on hosts below`)
 	}
-	b.WriteString(`</small></div>` + pill(g, gTpl) + modeButtons(allHosts, ge.mode, ge.tpl, tpls) + scheduleHTML(allHosts, ge, tpls) + `</div>`)
-	for _, h := range list {
-		e := parseEntry(state[h])
-		m, tpl, _ := e.effective(t)
+	all := []string{allHosts}
+	b.WriteString(`</small></div>` + pill(g, gTpl) + modeButtons(all, ge.mode, ge.tpl, tpls) + scheduleHTML(all, ge, tpls) + `</div>`)
+	groupRoutes := routes
+	if !grouped {
+		groupRoutes = nil // every name its own row
+	}
+	for _, group := range groupHosts(list, groupRoutes) {
 		note := ""
-		if routes != nil {
+		for _, h := range group {
+			if routes == nil {
+				break
+			}
 			if r, ok := routes[h]; !ok {
-				note = `<small class="bad">no Traefik router: this setting does nothing</small>`
+				note += `<small class="bad">` + html.EscapeString(h) + `: no Traefik router, this setting does nothing</small>`
 			} else if !r.protected() {
-				note = `<small class="bad">not protected: ` + html.EscapeString(strings.Join(r.unprotected, ", ")) + ` doesn't use the kill switch</small>`
+				note += `<small class="bad">` + html.EscapeString(h) + `: not protected, ` + html.EscapeString(strings.Join(r.unprotected, ", ")) + ` doesn't use the kill switch</small>`
 			}
 		}
-		b.WriteString(`<div class="row"><div class="host">` + html.EscapeString(h) + note + `</div>` + pill(m, tpl) + modeButtons(h, e.mode, e.tpl, tpls) + scheduleHTML(h, e, tpls) + `</div>`)
+		e := parseEntry(state[group[0]])
+		same := true
+		for _, h := range group[1:] {
+			if state[h] != state[group[0]] {
+				same = false
+			}
+		}
+		label := html.EscapeString(strings.Join(group, " + "))
+		if same {
+			m, tpl, _ := e.effective(t)
+			b.WriteString(`<div class="row"><div class="host">` + label + note + `</div>` + pill(m, tpl) + modeButtons(group, e.mode, e.tpl, tpls) + scheduleHTML(group, e, tpls) + `</div>`)
+			continue
+		}
+		// Names in one group differ (switched one by one): show each, one click aligns them.
+		detail := []string{}
+		scheduled := false
+		for _, h := range group {
+			he := parseEntry(state[h])
+			m, tpl, _ := he.effective(t)
+			d := h + ": " + modeLabel(m, tpl)
+			if he.scheduled() && !he.ended(t) {
+				d += ", scheduled"
+				scheduled = true
+			}
+			detail = append(detail, d)
+		}
+		cancel := ""
+		if scheduled {
+			cancel = `<div class="sched">Some names have a schedule<form method="post">` + hostFields(group) + `<button name="action" value="unschedule">Cancel all</button></form></div>`
+		}
+		b.WriteString(`<div class="row"><div class="host">` + label + `<small>` + html.EscapeString(strings.Join(detail, " · ")) + `</small>` + note + `</div>` +
+			`<span class="pill mixed">mixed</span>` + modeButtons(group, "", "", tpls) + cancel + scheduleHTML(group, entry{}, tpls) + `</div>`)
 	}
 	if len(list) == 0 {
 		b.WriteString(`<div class="row"><p>No sites seen yet. They appear after their first request, or add one below.</p></div>`)

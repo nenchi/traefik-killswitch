@@ -132,6 +132,15 @@ admin middleware, the plugin reads Traefik's routers and middlewares (including 
 Without `apiURL`, switching a host that hasn't passed the kill switch since Traefik started saves the
 setting but shows a warning.
 
+### Grouping
+
+With `apiURL`, names served by the same Traefik service (container) under the same domain are shown as one
+row and switched together: `m.example.com + media.example.com` is one row, while `media.home.arpa` (same
+container, LAN domain) stays separate. If the names of a row were switched one by one and differ, the row
+shows **mixed** with each name's mode, and one click aligns them. A group is only switched when every name
+in it passes the checks. **Group by service: on / off** at the top of the page toggles this per browser
+(cookie). The domain is the last two labels of a name. The history keeps one entry per name.
+
 ## Scheduled windows
 
 Every row on the admin page (including "All sites") has a **Schedule…** section: pick `maint` (and a page)
@@ -154,8 +163,8 @@ Every change is written to Traefik's log as an INFO line, with the user (from ba
 `X-Authentik-Username`) and the client IP:
 
 ```
-2026-10-26T21:14:02+01:00 INF KILL-SWITCH: app.example.com set to maint (page downtime) by alice from 192.168.1.50
-2026-10-26T21:15:40+01:00 INF KILL-SWITCH: schedule created for all sites: block from Mon 26 Oct 22:00 to Tue 27 Oct 02:00 CET by alice from 192.168.1.50
+2026-10-26T21:14:02+01:00 INF KILL-SWITCH: app.example.com set to maint (page downtime) by alice from 192.0.2.50
+2026-10-26T21:15:40+01:00 INF KILL-SWITCH: schedule created for all sites: block from Mon 26 Oct 22:00 to Tue 27 Oct 02:00 CET by alice from 192.0.2.50
 2026-10-26T22:00:00+01:00 INF KILL-SWITCH: schedule started for all sites: block until Tue 27 Oct 02:00 CET (created Mon 26 Oct 21:15 by alice)
 2026-10-27T02:00:00+01:00 INF KILL-SWITCH: schedule ended for all sites: back to on
 ```

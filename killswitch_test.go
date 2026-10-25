@@ -829,10 +829,115 @@ func TestSwitchAppliesImmediately(t *testing.T) {
 
 func TestTemplateSelectAutoSubmitsInMaint(t *testing.T) {
 	tpls := []string{"downtime"}
-	if !strings.Contains(modeButtons("a.lan", modeMaint, "", tpls), `onchange="this.form.requestSubmit(this.form.querySelector('button.maint'))"`) {
+	if !strings.Contains(modeButtons([]string{"a.lan"}, modeMaint, "", tpls), `onchange="this.form.requestSubmit(this.form.querySelector('button.maint'))"`) {
 		t.Fatal("maint row: dropdown must apply at once")
 	}
-	if strings.Contains(modeButtons("a.lan", modeOn, "", tpls), "onchange") {
+	if strings.Contains(modeButtons([]string{"a.lan"}, modeOn, "", tpls), "onchange") {
 		t.Fatal("on row: dropdown must only preselect")
+	}
+}
+
+func TestGroupHosts(t *testing.T) {
+	routes := map[string]route{
+		"m.example.com":      {services: []string{"media@docker"}},
+		"media.example.com":  {services: []string{"media@docker"}},
+		"media.home.arpa":    {services: []string{"media@docker"}}, // same container, LAN domain: own row
+		"a.example.com":      {services: []string{"app@docker"}},
+		"api.a.example.com":  {services: []string{"app@docker", "api@docker"}},
+		"x.example.com":      {services: []string{"api@docker"}}, // joins via api.a.example.com
+		"lonely.example.com": {services: []string{"l@docker"}},
+		"no-route.lan":       {},
+	}
+	list := []string{"a.example.com", "api.a.example.com", "m.example.com", "media.home.arpa", "media.example.com", "lonely.example.com", "no-route.lan", "x.example.com"}
+	got := fmt.Sprint(groupHosts(list, routes))
+	want := "[[a.example.com api.a.example.com x.example.com] [m.example.com media.example.com] [media.home.arpa] [lonely.example.com] [no-route.lan]]"
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	if got := fmt.Sprint(groupHosts([]string{"m.example.com", "media.example.com"}, nil)); got != "[[m.example.com] [media.example.com]]" {
+		t.Fatalf("ungrouped: %s", got)
+	}
+	for h, want := range map[string]string{"media.example.com": "example.com", "a.b.home.arpa": "home.arpa", "example.com": "example.com", "localhost": "localhost"} {
+		if got := baseDomain(h); got != want {
+			t.Errorf("baseDomain(%s) = %s, want %s", h, got, want)
+		}
+	}
+}
+
+func TestGroupRowSwitchesAllNames(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/api/http/routers" {
+			_, _ = rw.Write([]byte(`[{"name":"media@docker","rule":"Host(` + "`media.example.com`" + `) || Host(` + "`m.example.com`" + `)","status":"enabled","middlewares":["gate-grp"],"service":"media"},
+				{"name":"media-lan@docker","rule":"Host(` + "`media.home.arpa`" + `)","status":"enabled","middlewares":["gate-grp"],"service":"media"}]`))
+			return
+		}
+		_, _ = rw.Write([]byte(`[]`))
+	}))
+	defer api.Close()
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {})
+	gate, err := New(context.Background(), next, &Config{StateFile: stateFile}, "gate-grp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { seenMu.Lock(); delete(excludedBy, "gate-grp"); delete(maintFiles, "gate-grp"); seenMu.Unlock() }()
+	admin, err := New(context.Background(), next, &Config{StateFile: stateFile, Admin: true, APIURL: api.URL}, "admin-grp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := func(cookie string) string {
+		req := httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil)
+		if cookie != "" {
+			req.AddCookie(&http.Cookie{Name: "ks_group", Value: cookie})
+		}
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		return rec.Body.String()
+	}
+	if p := page(""); !strings.Contains(p, ">m.example.com + media.example.com<") || !strings.Contains(p, ">media.home.arpa<") {
+		t.Fatal("grouped page should show m.example.com + media.example.com as one row and media.home.arpa apart")
+	}
+	if p := page("off"); strings.Contains(p, "m.example.com + media.example.com") || !strings.Contains(p, "<b>off</b>") {
+		t.Fatal("grouping off should list names separately")
+	}
+	// the toggle sets the cookie
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/?group=off", nil))
+	if c := rec.Header().Get("Set-Cookie"); !strings.Contains(c, "ks_group=off") || rec.Code != http.StatusSeeOther {
+		t.Fatalf("toggle: %d %q", rec.Code, c)
+	}
+
+	// one click on the group row switches both names
+	form := url.Values{"host": {"m.example.com", "media.example.com"}, "mode": {"maint"}}
+	req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	admin.ServeHTTP(rec, req)
+	if loc := rec.Header().Get("Location"); strings.Contains(loc, "err=") {
+		t.Fatal(loc)
+	}
+	for host, want := range map[string]int{"m.example.com": 503, "media.example.com": 503, "media.home.arpa": 200} {
+		if c := hit(gate, host); c != want {
+			t.Errorf("%s: got %d, want %d", host, c, want)
+		}
+	}
+
+	// switched one by one -> "mixed" row
+	set(t, admin, "m.example.com", "on", nil)
+	if p := page(""); !strings.Contains(p, `pill mixed`) || !strings.Contains(p, "m.example.com: on · media.example.com: maint") {
+		t.Fatal("differing names should show as mixed with each mode")
+	}
+
+	// a refused name aborts the whole group
+	form = url.Values{"host": {"media.example.com", "typo.lan"}, "mode": {"block"}}
+	req = httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	admin.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Header().Get("Location"), "err=") {
+		t.Fatal("group with an unknown name accepted")
+	}
+	if c := hit(gate, "media.example.com"); c != 503 {
+		t.Fatalf("media.example.com changed although the group was refused: %d", c)
 	}
 }
