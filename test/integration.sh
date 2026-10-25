@@ -94,7 +94,17 @@ expect "set *=on"            "$(set_mode '*' on)" 303
 expect "a back to maint"     "$(code_within a.lan 503)" 503
 expect "set a=on"            "$(set_mode a.lan on)" 303
 expect "a passes again"      "$(code_within a.lan 418)" 418
+post() { curl -s -o /dev/null -w '%{http_code}' "$@" http://127.0.0.1:18081/; }
+FROM=$(date -d '-1 min' +%Y-%m-%dT%H:%M); TO=$(date -d '+1 hour' +%Y-%m-%dT%H:%M)
+expect "schedule b block now" "$(post -d "host=b.lan&action=schedule&mode=block&from=$FROM&to=$TO")" 303
+expect "b blocked by window" "$(code_within b.lan 403)" 403
+expect "cancel b window"     "$(post -d "host=b.lan&action=unschedule")" 303
+expect "b passes again"      "$(code_within b.lan 418)" 418
+FROM=$(date -d '+1 hour' +%Y-%m-%dT%H:%M); TO=$(date -d '+2 hour' +%Y-%m-%dT%H:%M)
+expect "schedule b later"    "$(post -d "host=b.lan&action=schedule&mode=maint&from=$FROM&to=$TO")" 303
+expect "b passes before window" "$(code_within b.lan 418)" 418
 PAGE=$(curl -s http://127.0.0.1:18081/)
+echo "$PAGE" | grep -q '(upcoming)' && echo "ok   admin shows upcoming window" || { echo "FAIL upcoming window not shown"; exit 1; }
 echo "$PAGE" | grep -q 'value="b.lan"' && echo "ok   admin lists seen host b.lan" || { echo "FAIL admin does not list seen host"; exit 1; }
 echo "$PAGE" | grep -q '<li>ks.lan</li>' && echo "ok   admin lists excluded host ks.lan as always on" || { echo "FAIL excluded host not shown"; exit 1; }
 cat "$STATE"; echo

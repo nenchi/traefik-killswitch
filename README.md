@@ -111,7 +111,22 @@ You can also edit the state file by hand or from a script:
 { "*": "on", "app.example.com": "maint", "api.example.com": "maint:downtime", "old.example.com": "block" }
 ```
 
-`maint:downtime` means maintenance mode with the `downtime` template (see below).
+`maint:downtime` means maintenance mode with the `downtime` template (see below). A value can also carry
+a scheduled window: `"on|block|2026-10-26T22:00:00+01:00|2026-10-27T02:00:00+01:00"` means "normally on,
+blocked during that window".
+
+## Scheduled windows
+
+Every row on the admin page (including "All sites") has a **Schedule…** section: pick `maint` (and a page)
+or `block`, plus a start and an end. During the window the site gets that mode; before and after, it has
+its normal mode. Nobody has to be around to switch it off or back on.
+
+- One window per site. Planning a new one replaces it; **Cancel** removes it.
+- The window is checked on every request, so it starts and ends on time, to the second.
+- Times are entered and shown in server time (the Traefik container's time zone, e.g. `TZ=Europe/Berlin`).
+  The admin page shows the zone and the current server time.
+- During a `maint` window, `Retry-After` tells clients when the window ends.
+- An ended window is removed the next time the state file is saved.
 
 ## Custom maintenance page
 

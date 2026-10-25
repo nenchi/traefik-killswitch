@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -285,5 +286,113 @@ func TestTemplates(t *testing.T) {
 	admin.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
 	if !strings.Contains(page.Body.String(), `<option value="downtime"`) {
 		t.Fatal("admin page has no template select")
+	}
+}
+
+func TestSchedule(t *testing.T) {
+	gate, admin, stateFile := newPair(t)
+	base := time.Date(2026, 10, 26, 21, 0, 0, 0, time.Local)
+	clock := base
+	now = func() time.Time { return clock }
+	defer func() { now = time.Now }()
+
+	post := func(form url.Values) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		return rec.Header().Get("Location")
+	}
+	schedule := func(host, mode, from, to string) string {
+		return post(url.Values{"host": {host}, "action": {"schedule"}, "mode": {mode}, "from": {from}, "to": {to}})
+	}
+
+	if loc := schedule("a.lan", "block", "2026-10-26T22:00", "2026-10-27T02:00"); strings.Contains(loc, "err=") {
+		t.Fatalf("schedule rejected: %s", loc)
+	}
+	steps := []struct {
+		at   time.Duration
+		want int
+	}{
+		{0, 200},                         // 21:00 before the window
+		{time.Hour, 403},                 // 22:00 start is inclusive
+		{5*time.Hour - time.Second, 403}, // 01:59:59
+		{5 * time.Hour, 200},             // 02:00 end is exclusive
+	}
+	for _, s := range steps {
+		clock = base.Add(s.at)
+		if c := hit(gate, "a.lan"); c != s.want {
+			t.Fatalf("at %s: got %d, want %d", clock.Format(timeFmt), c, s.want)
+		}
+	}
+
+	// switching the normal mode keeps the window
+	clock = base
+	post(url.Values{"host": {"a.lan"}, "mode": {"maint"}})
+	if c := hit(gate, "a.lan"); c != 503 {
+		t.Fatalf("normal mode maint: got %d", c)
+	}
+	clock = base.Add(90 * time.Minute)
+	if c := hit(gate, "a.lan"); c != 403 {
+		t.Fatalf("window lost after mode change: got %d", c)
+	}
+
+	// cancel
+	post(url.Values{"host": {"a.lan"}, "action": {"unschedule"}})
+	if c := hit(gate, "a.lan"); c != 503 {
+		t.Fatalf("after cancel: got %d, want normal mode 503", c)
+	}
+
+	// a maint window sets Retry-After to the window's end
+	clock = base
+	schedule("b.lan", "maint", "2026-10-26T20:00", "2026-10-26T21:30")
+	gate.(*KillSwitch).checked = time.Time{}
+	rec := httptest.NewRecorder()
+	now = time.Now // Retry-After uses the real clock
+	clock = time.Now()
+	from, to := clock.Add(-time.Minute).Format("2006-01-02T15:04"), clock.Add(time.Hour).Format("2006-01-02T15:04")
+	schedule("c.lan", "maint", from, to)
+	gate.(*KillSwitch).checked = time.Time{}
+	gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://c.lan/", nil))
+	if rec.Code != 503 {
+		t.Fatalf("active maint window: got %d", rec.Code)
+	}
+	if ra, _ := strconv.Atoi(rec.Header().Get("Retry-After")); ra < 3000 || ra > 3700 {
+		t.Fatalf("Retry-After %q, want about an hour", rec.Header().Get("Retry-After"))
+	}
+	now = func() time.Time { return clock }
+
+	// validation
+	for _, bad := range [][4]string{
+		{"a.lan", "on", "2026-10-26T22:00", "2026-10-27T02:00"},
+		{"a.lan", "block", "2026-10-27T02:00", "2026-10-26T22:00"},
+		{"a.lan", "block", "2020-01-01T00:00", "2020-01-01T01:00"},
+		{"a.lan", "block", "", "2026-10-27T02:00"},
+	} {
+		if loc := schedule(bad[0], bad[1], bad[2], bad[3]); !strings.Contains(loc, "err=") {
+			t.Fatalf("accepted invalid schedule %v", bad)
+		}
+	}
+
+	// old plain values still parse, and the state file stays readable JSON
+	b, err := os.ReadFile(stateFile)
+	if err != nil || !strings.Contains(string(b), `"c.lan": "on|maint|`) {
+		t.Fatalf("state file: %s %v", b, err)
+	}
+	if e := parseEntry("maint:downtime"); e.mode != "maint" || e.tpl != "downtime" || e.scheduled() {
+		t.Fatalf("plain value parsed as %+v", e)
+	}
+}
+
+func TestExpiredWindowIsDropped(t *testing.T) {
+	_, admin, stateFile := newPair(t)
+	if err := os.WriteFile(stateFile, []byte(`{"a.lan":"maint|block|2020-01-01T00:00:00Z|2020-01-01T01:00:00Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set(t, admin, "a.lan", "block", nil)
+	b, _ := os.ReadFile(stateFile)
+	if strings.Contains(string(b), "2020") {
+		t.Fatalf("expired window kept: %s", b)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -110,12 +111,16 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	seen[host] = true
 	seenMu.Unlock()
 
-	mode, tpl := k.modeFor(host)
+	mode, tpl, until := k.modeFor(host)
 	switch mode {
 	case modeMaint:
+		retry := 300
+		if !until.IsZero() {
+			retry = int(time.Until(until).Seconds()) + 1
+		}
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		rw.Header().Set("Cache-Control", "no-store")
-		rw.Header().Set("Retry-After", "300")
+		rw.Header().Set("Retry-After", strconv.Itoa(retry))
 		rw.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = rw.Write(k.maintPage(tpl))
 	case modeBlock:
@@ -146,13 +151,76 @@ func (k *KillSwitch) maintPage(tpl string) []byte {
 	return []byte(defaultMaintPage)
 }
 
-// modeFor returns the effective mode and template: a non-"on" global switch wins over the per-host one.
-func (k *KillSwitch) modeFor(host string) (string, string) {
+// modeFor returns the effective mode, template and, inside a scheduled window, its end.
+// A non-"on" global switch wins over the per-host one.
+func (k *KillSwitch) modeFor(host string) (string, string, time.Time) {
 	state := k.load()
-	if m, tpl := splitMode(state[allHosts]); m != modeOn {
-		return m, tpl
+	t := now()
+	if m, tpl, until := parseEntry(state[allHosts]).effective(t); m != modeOn {
+		return m, tpl, until
 	}
-	return splitMode(state[host])
+	return parseEntry(state[host]).effective(t)
+}
+
+// now is the clock; tests replace it.
+var now = time.Now
+
+// entry is one state value: the normal mode, plus an optional scheduled window with its own mode.
+// Stored as "maint:downtime" or, with a window, "on|block|<from RFC3339>|<to RFC3339>".
+type entry struct {
+	mode, tpl   string
+	sMode, sTpl string
+	from, to    time.Time
+}
+
+func parseEntry(v string) entry {
+	parts := strings.Split(v, "|")
+	var e entry
+	// Separate statements on purpose: Yaegi mishandles tuple assignment to struct fields.
+	mode, tpl := splitMode(parts[0])
+	e.mode = mode
+	e.tpl = tpl
+	if len(parts) == 4 {
+		from, err1 := time.Parse(time.RFC3339, parts[2])
+		to, err2 := time.Parse(time.RFC3339, parts[3])
+		if err1 == nil && err2 == nil {
+			sMode, sTpl := splitMode(parts[1])
+			e.sMode = sMode
+			e.sTpl = sTpl
+			e.from = from
+			e.to = to
+		}
+	}
+	return e
+}
+
+func (e entry) String() string {
+	v := joinMode(e.mode, e.tpl)
+	if e.scheduled() {
+		v += "|" + joinMode(e.sMode, e.sTpl) + "|" + e.from.Format(time.RFC3339) + "|" + e.to.Format(time.RFC3339)
+	}
+	return v
+}
+
+func (e entry) scheduled() bool { return !e.to.IsZero() }
+
+func (e entry) active(t time.Time) bool {
+	return e.scheduled() && !t.Before(e.from) && t.Before(e.to)
+}
+
+// effective returns the mode and template in force at t, and the window's end while one is active.
+func (e entry) effective(t time.Time) (string, string, time.Time) {
+	if e.active(t) {
+		return e.sMode, e.sTpl, e.to
+	}
+	return e.mode, e.tpl, time.Time{}
+}
+
+func joinMode(mode, tpl string) string {
+	if tpl != "" {
+		return mode + ":" + tpl
+	}
+	return mode
 }
 
 // splitMode parses a state value: "maint", or "maint:downtime" to pick a template. Empty means "on".
@@ -265,7 +333,8 @@ func readState(path string) (map[string]string, error) {
 // writeMu serializes read-modify-write of the state file across admin instances.
 var writeMu sync.Mutex
 
-func (k *KillSwitch) setMode(host, mode, tpl string) error {
+// update applies fn to host's entry and saves the state file, dropping windows that have ended.
+func (k *KillSwitch) update(host string, fn func(e *entry)) error {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	state, err := readState(k.stateFile)
@@ -275,14 +344,15 @@ func (k *KillSwitch) setMode(host, mode, tpl string) error {
 	} else if err != nil {
 		return err
 	}
-	value := mode
-	if tpl != "" {
-		value += ":" + tpl
+	e := parseEntry(state[host])
+	fn(&e)
+	if e.scheduled() && !now().Before(e.to) {
+		e.to = time.Time{}
 	}
-	if value == modeOn && host != allHosts {
+	if v := e.String(); v == modeOn && host != allHosts {
 		delete(state, host)
 	} else {
-		state[host] = value
+		state[host] = v
 	}
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -318,25 +388,62 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 		}
 		host := strings.ToLower(strings.TrimSpace(req.PostForm.Get("host")))
 		mode := req.PostForm.Get("mode")
-		if host == "" || (mode != modeOn && mode != modeMaint && mode != modeBlock) {
+		action := req.PostForm.Get("action")
+		if host == "" || (action != "unschedule" && mode != modeOn && mode != modeMaint && mode != modeBlock) {
 			http.Error(rw, "invalid host or mode", http.StatusBadRequest)
 			return
 		}
-		target := req.URL.Path
+		fail := func(msg string) {
+			http.Redirect(rw, req, req.URL.Path+"?err="+url.QueryEscape(msg), http.StatusSeeOther)
+		}
 		tpl := req.PostForm.Get("template")
 		if tpl != "" && !contains(templates(), tpl) {
-			http.Redirect(rw, req, target+"?err="+url.QueryEscape("unknown template "+tpl), http.StatusSeeOther)
+			fail("unknown template " + tpl)
 			return
 		}
 		if excludedHosts()[host] {
-			http.Redirect(rw, req, target+"?err="+url.QueryEscape(host+" is in excludeHosts and is never switched off"), http.StatusSeeOther)
+			fail(host + " is in excludeHosts and is never switched off")
 			return
 		}
-		if err := k.setMode(host, mode, tpl); err != nil {
-			log.Printf("killswitch %s: saving state: %v", k.name, err)
-			target += "?err=" + url.QueryEscape(err.Error())
+		var fn func(e *entry)
+		switch action {
+		case "schedule":
+			from, err1 := time.ParseInLocation("2006-01-02T15:04", req.PostForm.Get("from"), time.Local)
+			to, err2 := time.ParseInLocation("2006-01-02T15:04", req.PostForm.Get("to"), time.Local)
+			switch {
+			case err1 != nil || err2 != nil:
+				fail("enter both a start and an end date and time")
+				return
+			case mode == modeOn:
+				fail("a schedule must switch to maint or block")
+				return
+			case !to.After(from):
+				fail("the end must be after the start")
+				return
+			case !to.After(now()):
+				fail("the end is in the past")
+				return
+			}
+			fn = func(e *entry) {
+				e.sMode = mode
+				e.sTpl = tpl
+				e.from = from
+				e.to = to
+			}
+		case "unschedule":
+			fn = func(e *entry) { e.to = time.Time{} }
+		default:
+			fn = func(e *entry) {
+				e.mode = mode
+				e.tpl = tpl
+			}
 		}
-		http.Redirect(rw, req, target, http.StatusSeeOther)
+		if err := k.update(host, fn); err != nil {
+			log.Printf("killswitch %s: saving state: %v", k.name, err)
+			fail("Save failed: " + err.Error())
+			return
+		}
+		http.Redirect(rw, req, req.URL.Path, http.StatusSeeOther)
 	default:
 		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -402,6 +509,10 @@ select{font:inherit;padding:.3rem .5rem;border-radius:8px;border:1px solid var(-
 input{font:inherit;padding:.3rem .6rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);flex:1 1 14rem}
 .err{background:var(--err);border-radius:8px;padding:.6rem 1rem;color:var(--text)}
 ul.excl{margin:0;padding:.6rem 1rem .6rem 2rem;color:var(--muted)}
+.sched{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .75rem;font-size:.9rem;color:var(--muted)}
+.sched b{color:var(--text)}details{flex-basis:100%}summary{cursor:pointer;color:var(--muted);font-size:.9rem}
+details form{flex-wrap:wrap;align-items:center;margin-top:.5rem}details label{display:flex;gap:.35rem;align-items:center}
+details input{flex:0 1 auto}
 </style>`
 
 // modeButtons renders the per-host form; with templates, a select picks the page "maint" will show.
@@ -437,6 +548,34 @@ func templateSelect(tpls []string, cur string) string {
 	return b.String()
 }
 
+const timeFmt = "Mon 02 Jan 15:04"
+
+// scheduleHTML shows a host's window with a Cancel button, and a form to plan a new one.
+func scheduleHTML(host string, e entry, tpls []string) string {
+	var b strings.Builder
+	eh := html.EscapeString(host)
+	t := now()
+	if e.scheduled() {
+		state := "upcoming"
+		if e.active(t) {
+			state = "active"
+		}
+		label := e.sMode
+		if e.sTpl != "" {
+			label += " · " + e.sTpl
+		}
+		b.WriteString(`<div class="sched">Scheduled <span class="pill ` + e.sMode + `">` + html.EscapeString(label) + `</span> <b>` +
+			e.from.In(time.Local).Format(timeFmt) + ` → ` + e.to.In(time.Local).Format(timeFmt) + `</b> (` + state + `)` +
+			`<form method="post"><input type="hidden" name="host" value="` + eh + `"><button name="action" value="unschedule">Cancel</button></form></div>`)
+	}
+	b.WriteString(`<details><summary>Schedule…</summary><form method="post"><input type="hidden" name="host" value="` + eh + `">` +
+		`<input type="hidden" name="action" value="schedule"><select name="mode" aria-label="Scheduled mode"><option value="maint">maint</option><option value="block">block</option></select>` +
+		templateSelect(tpls, "") +
+		`<label>from <input type="datetime-local" name="from" required></label><label>to <input type="datetime-local" name="to" required></label>` +
+		`<button>Schedule</button></form></details>`)
+	return b.String()
+}
+
 func (k *KillSwitch) renderAdmin(errMsg string) string {
 	state := k.load()
 	excluded := excludedHosts()
@@ -464,6 +603,7 @@ func (k *KillSwitch) renderAdmin(errMsg string) string {
 	sort.Strings(exList)
 
 	tpls := templates()
+	t := now()
 	pill := func(m, tpl string) string {
 		label := m
 		if m == modeMaint && tpl != "" {
@@ -479,18 +619,21 @@ func (k *KillSwitch) renderAdmin(errMsg string) string {
 	if len(tpls) > 0 {
 		b.WriteString(`<p>Pick a page in the list, then click <b>maint</b>. Clicking <b>maint</b> again switches a site to the newly picked page.</p>`)
 	}
+	b.WriteString(`<p>Schedules use server time (` + t.Format("MST") + `, now ` + t.Format(timeFmt) + `). A site switches back to its normal mode when its window ends.</p>`)
 	if errMsg != "" {
 		b.WriteString(`<p class="err">` + html.EscapeString(errMsg) + `</p>`)
 	}
-	g, gTpl := splitMode(state[allHosts])
+	ge := parseEntry(state[allHosts])
+	g, gTpl, _ := ge.effective(t)
 	b.WriteString(`<div class="card"><div class="row all"><div class="host">All sites<small>Overrides every per-site setting while not "on"`)
 	if len(exList) > 0 {
 		b.WriteString(`, except the always-on hosts below`)
 	}
-	b.WriteString(`</small></div>` + pill(g, gTpl) + modeButtons(allHosts, g, gTpl, tpls) + `</div>`)
+	b.WriteString(`</small></div>` + pill(g, gTpl) + modeButtons(allHosts, ge.mode, ge.tpl, tpls) + scheduleHTML(allHosts, ge, tpls) + `</div>`)
 	for _, h := range list {
-		m, tpl := splitMode(state[h])
-		b.WriteString(`<div class="row"><div class="host">` + html.EscapeString(h) + `</div>` + pill(m, tpl) + modeButtons(h, m, tpl, tpls) + `</div>`)
+		e := parseEntry(state[h])
+		m, tpl, _ := e.effective(t)
+		b.WriteString(`<div class="row"><div class="host">` + html.EscapeString(h) + `</div>` + pill(m, tpl) + modeButtons(h, e.mode, e.tpl, tpls) + scheduleHTML(h, e, tpls) + `</div>`)
 	}
 	if len(list) == 0 {
 		b.WriteString(`<div class="row"><p>No sites seen yet. They appear after their first request, or add one below.</p></div>`)
