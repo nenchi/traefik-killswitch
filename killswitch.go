@@ -81,8 +81,6 @@ type KillSwitch struct {
 
 	mu      sync.Mutex
 	state   map[string]string
-	modTime time.Time
-	size    int64
 	checked time.Time
 	gen     int
 }
@@ -583,7 +581,7 @@ func templates() []string {
 	return list
 }
 
-// load returns the cached state, re-reading the file when its mtime changes (checked at most once a second).
+// load returns the state, re-reading the file at most once a second, and right after any admin save.
 // stateGen counts saves from the admin page; every instance re-reads the state file when it changes,
 // so a switch applies on the very next request. The 1s re-check only covers edits made outside the plugin.
 var (
@@ -609,26 +607,19 @@ func (k *KillSwitch) load() map[string]string {
 	if k.state == nil {
 		k.state = map[string]string{}
 	}
-	fi, err := os.Stat(k.stateFile)
+	// Always re-read: the file is tiny, and an mtime+size shortcut missed same-length changes ("maint" →
+	// "block") saved within one timestamp tick on filesystems with coarse mtimes.
+	state, err := readState(k.stateFile)
 	if errors.Is(err, fs.ErrNotExist) {
 		k.state = map[string]string{} // no file = everything on
-		k.modTime = time.Time{}
-		k.size = 0
 		return k.state
 	}
-	if err == nil && fi.ModTime().Equal(k.modTime) && fi.Size() == k.size {
-		return k.state
-	}
-	state, err := readState(k.stateFile)
 	if err != nil {
 		// Fail safe: a corrupt or unreadable file keeps the last good state rather than reopening blocked sites.
 		log.Printf("killswitch %s: %v (keeping last state)", k.name, err)
 		return k.state
 	}
-	// Separate statements on purpose: Yaegi mishandles tuple assignment to struct fields.
 	k.state = state
-	k.modTime = fi.ModTime()
-	k.size = fi.Size()
 	return k.state
 }
 

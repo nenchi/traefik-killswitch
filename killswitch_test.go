@@ -801,7 +801,10 @@ func TestAdminFavicon(t *testing.T) {
 }
 
 func TestSwitchAppliesImmediately(t *testing.T) {
-	gate, admin, _ := newPair(t)
+	gate, admin, stateFile := newPair(t)
+	// Every save gets the same mtime, like on a filesystem with coarse timestamps (GitHub's runners):
+	// "maint" → "block" then changes neither mtime nor size.
+	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	get := func() int { // no cache reset: must see admin changes on the very next request
 		rec := httptest.NewRecorder()
 		gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://a.lan/", nil))
@@ -815,6 +818,9 @@ func TestSwitchAppliesImmediately(t *testing.T) {
 		want int
 	}{{"maint", 503}, {"block", 403}, {"on", 200}, {"maint", 503}} {
 		set(t, admin, "a.lan", c.mode, nil)
+		if err := os.Chtimes(stateFile, fixed, fixed); err != nil {
+			t.Fatal(err)
+		}
 		if got := get(); got != c.want {
 			t.Fatalf("right after set %s: got %d, want %d", c.mode, got, c.want)
 		}
