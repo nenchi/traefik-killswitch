@@ -180,12 +180,12 @@ Start from [`examples/maintenance.html`](examples/maintenance.html): copy it nex
 
 Every other `.html` file in the same directory as `maintenanceFile` is a template you can pick per site
 in the admin page. For example, add [`examples/downtime.html`](examples/downtime.html) for unplanned
-outages:
+outages and [`examples/scheduled.html`](examples/scheduled.html) for planned work such as a weekly update window:
 
 ```
 /data/maintenance.html   ← default page
 /data/downtime.html      ← shows up as "downtime"
-/data/planned-update.html
+/data/scheduled.html     ← shows up as "scheduled"
 ```
 
 Each row on the admin page then gets a dropdown: pick a page and click **maint**. To switch a site that's

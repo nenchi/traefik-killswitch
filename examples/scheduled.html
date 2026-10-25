@@ -1,0 +1,53 @@
+<!doctype html>
+<!--
+  Example "scheduled maintenance" template for traefik-killswitch: planned work, no incident.
+  Put it next to your maintenanceFile and pick it per site in the admin page (it shows up as
+  "scheduled"), e.g. for a weekly update window. Keep it self-contained: while a site is in maintenance
+  every request to it returns this page, so CSS, images or fonts hosted on that site won't load.
+  Inline everything (images as data: URIs or inline SVG). Edits apply immediately,
+  with no Traefik restart.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Scheduled maintenance</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5d6675; --accent: #2f6fd6; --border: #e3e6eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1d2128; --text: #e8eaee; --muted: #a0a8b5; --accent: #6ea8ff; --border: #2c323b; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
+    background: var(--bg); color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main {
+    max-width: 34rem; width: 100%; text-align: center; padding: 2.5rem 2rem;
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+  }
+  svg { width: 56px; height: 56px; color: var(--accent); }
+  h1 { font-size: 1.6rem; margin: 1rem 0 .5rem; }
+  p { color: var(--muted); margin: .5rem 0; }
+  .eta { display: inline-block; margin-top: 1rem; padding: .35rem .9rem; border-radius: 999px;
+         background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--text); font-weight: 600; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <!-- clock icon, inline so it loads while the site is down -->
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
+  </svg>
+  <h1>Scheduled maintenance</h1>
+  <p>This site is undergoing scheduled maintenance and will be back shortly. Thanks for your patience.</p>
+  <!-- Edit or delete the next line -->
+  <span class="eta">Expected back: soon</span>
+</main>
+</body>
+</html>
