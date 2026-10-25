@@ -111,6 +111,15 @@ You can also edit the state file by hand or from a script:
 { "*": "on", "app.example.com": "maint", "old.example.com": "block" }
 ```
 
+## Custom maintenance page
+
+Start from [`examples/maintenance.html`](examples/maintenance.html): copy it next to the state file
+(e.g. `/data/maintenance.html`), edit the text, and set `maintenanceFile: /data/maintenance.html`.
+
+- **Keep it one self-contained file.** While a site is in maintenance, every request to it returns this
+  page, including requests for its CSS, images and fonts. Inline your styles, and use inline SVG or `data:` URIs for images.
+- Traefik reads the file at startup, so restart Traefik after editing it.
+
 ## Security
 
 - **Put authentication in front of the admin router** (forwardAuth, Authelia, Authentik, basicAuth, an IP
