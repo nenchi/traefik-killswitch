@@ -3,6 +3,7 @@
   "extends": ["config:recommended"],
   "labels": ["dependencies"],
   "platformAutomerge": false,
+  "dependencyDashboard": false,
   "customManagers": [
     {
       "description": "Traefik and Yaegi versions the CI tests run against (# renovate: comments in ci.yml)",
