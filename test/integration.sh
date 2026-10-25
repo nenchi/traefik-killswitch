@@ -98,6 +98,7 @@ post() { curl -s -o /dev/null -w '%{http_code}' "$@" http://127.0.0.1:18081/; }
 FROM=$(date -d '-1 min' +%Y-%m-%dT%H:%M); TO=$(date -d '+1 hour' +%Y-%m-%dT%H:%M)
 expect "schedule b block now" "$(post -d "host=b.lan&action=schedule&mode=block&from=$FROM&to=$TO")" 303
 expect "b blocked by window" "$(code_within b.lan 403)" 403
+for _ in $(seq 15); do grep -q 'INF KILL-SWITCH: schedule active since' "$RUN/traefik.log" && break; sleep 0.2; done
 expect "cancel b window"     "$(post -d "host=b.lan&action=unschedule")" 303
 expect "b passes again"      "$(code_within b.lan 418)" 418
 FROM=$(date -d '+1 hour' +%Y-%m-%dT%H:%M); TO=$(date -d '+2 hour' +%Y-%m-%dT%H:%M)
@@ -107,4 +108,8 @@ PAGE=$(curl -s http://127.0.0.1:18081/)
 echo "$PAGE" | grep -q '(upcoming)' && echo "ok   admin shows upcoming window" || { echo "FAIL upcoming window not shown"; exit 1; }
 echo "$PAGE" | grep -q 'value="b.lan"' && echo "ok   admin lists seen host b.lan" || { echo "FAIL admin does not list seen host"; exit 1; }
 echo "$PAGE" | grep -q '<li>ks.lan</li>' && echo "ok   admin lists excluded host ks.lan as always on" || { echo "FAIL excluded host not shown"; exit 1; }
+for want in 'INF KILL-SWITCH: a.lan set to maint from 127.0.0.1' 'INF KILL-SWITCH: all sites set to block' \
+  'INF KILL-SWITCH: schedule created for b.lan: block' 'INF KILL-SWITCH: schedule active since' 'INF KILL-SWITCH: schedule cancelled for b.lan'; do
+  grep -q "$want" "$RUN/traefik.log" && echo "ok   log: $want" || { echo "FAIL log missing: $want"; grep KILL-SWITCH "$RUN/traefik.log"; exit 1; }
+done
 cat "$STATE"; echo

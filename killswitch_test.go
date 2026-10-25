@@ -1,7 +1,9 @@
 package traefik_killswitch
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -395,4 +397,64 @@ func TestExpiredWindowIsDropped(t *testing.T) {
 	if strings.Contains(string(b), "2020") {
 		t.Fatalf("expired window kept: %s", b)
 	}
+}
+
+func TestLogging(t *testing.T) {
+	var buf bytes.Buffer
+	infoLog = log.New(&buf, "", 0)
+	defer func() { infoLog = log.New(os.Stdout, "", 0) }()
+	gate, admin, _ := newPair(t)
+	k := gate.(*KillSwitch)
+
+	post := func(form url.Values) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.SetBasicAuth("alice", "secret")
+		req.Header.Set("X-Real-Ip", "192.0.2.7")
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		if loc := rec.Header().Get("Location"); strings.Contains(loc, "err=") {
+			t.Fatalf("post rejected: %s", loc)
+		}
+	}
+	expectLog := func(want string) {
+		t.Helper()
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("log missing %q, got:\n%s", want, buf.String())
+		}
+	}
+
+	post(url.Values{"host": {"a.lan"}, "mode": {"maint"}})
+	expectLog(" INF KILL-SWITCH: a.lan set to maint by alice from 192.0.2.7")
+	post(url.Values{"host": {"*"}, "mode": {"on"}})
+	expectLog("KILL-SWITCH: all sites set to on by alice")
+
+	from := time.Now().Add(time.Hour).Truncate(time.Minute)
+	to := from.Add(2 * time.Hour)
+	post(url.Values{"host": {"b.lan"}, "action": {"schedule"}, "mode": {"block"},
+		"from": {from.Format("2006-01-02T15:04")}, "to": {to.Format("2006-01-02T15:04")}})
+	expectLog("KILL-SWITCH: schedule created for b.lan: block from " + from.Format(timeFmt))
+
+	k.checked = time.Time{}
+	k.checkWindows(from.Add(time.Second))
+	expectLog("KILL-SWITCH: schedule started for b.lan: block until " + to.Format(timeFmt))
+	expectLog("by alice)")
+	n := strings.Count(buf.String(), "schedule started")
+	k.checkWindows(from.Add(2 * time.Second))
+	if strings.Count(buf.String(), "schedule started") != n {
+		t.Fatal("start logged twice")
+	}
+	k.checkWindows(to)
+	expectLog("KILL-SWITCH: schedule ended for b.lan: back to on")
+
+	// a window first seen while already running (Traefik restarted mid-window)
+	announcedMu.Lock()
+	announced = map[string]string{}
+	announcedMu.Unlock()
+	k.checkWindows(from.Add(30 * time.Minute))
+	expectLog("KILL-SWITCH: schedule active since " + from.Format(timeFmt) + " for b.lan")
+
+	post(url.Values{"host": {"b.lan"}, "action": {"unschedule"}})
+	expectLog("KILL-SWITCH: schedule cancelled for b.lan by alice")
 }

@@ -128,6 +128,21 @@ its normal mode. Nobody has to be around to switch it off or back on.
 - During a `maint` window, `Retry-After` tells clients when the window ends.
 - An ended window is removed the next time the state file is saved.
 
+## Logging
+
+Every change is written to Traefik's log as an INFO line, with the user (from basic auth or Authentik's
+`X-Authentik-Username`) and the client IP:
+
+```
+2026-10-26T21:14:02+01:00 INF KILL-SWITCH: app.example.com set to maint (page downtime) by alice from 192.168.1.50
+2026-10-26T21:15:40+01:00 INF KILL-SWITCH: schedule created for all sites: block from Mon 26 Oct 22:00 to Tue 27 Oct 02:00 CET by alice from 192.168.1.50
+2026-10-26T22:00:00+01:00 INF KILL-SWITCH: schedule started for all sites: block until Tue 27 Oct 02:00 CET (created Mon 26 Oct 21:15 by alice)
+2026-10-27T02:00:00+01:00 INF KILL-SWITCH: schedule ended for all sites: back to on
+```
+
+A window that's already running when Traefik starts is logged as `schedule active since …`.
+Filter with `docker logs traefik 2>&1 | grep KILL-SWITCH`. Errors are logged at ERR level as before.
+
 ## Custom maintenance page
 
 Start from [`examples/maintenance.html`](examples/maintenance.html): copy it next to the state file

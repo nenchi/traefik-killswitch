@@ -87,13 +87,16 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		exclude[h] = true
 		list = append(list, h)
 	}
+	k := &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile, exclude: exclude}
+	seenMu.Lock()
 	if !config.Admin {
-		seenMu.Lock()
 		excludedBy[name] = list
 		maintFiles[name] = config.MaintenanceFile
-		seenMu.Unlock()
 	}
-	return &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile, exclude: exclude}, nil
+	watched[config.StateFile] = k
+	seenMu.Unlock()
+	watchOnce.Do(func() { go watch() })
+	return k, nil
 }
 
 func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -165,12 +168,122 @@ func (k *KillSwitch) modeFor(host string) (string, string, time.Time) {
 // now is the clock; tests replace it.
 var now = time.Now
 
+// infoLog writes Traefik-style INFO lines to stdout. Traefik tags the standard logger's output as ERR,
+// so actions are logged here instead; errors still go through log.Printf.
+var infoLog = log.New(os.Stdout, "", 0)
+
+func logInfo(format string, args ...interface{}) {
+	infoLog.Printf("%s INF KILL-SWITCH: %s", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
+}
+
+// watched holds one instance per state file; watch() logs scheduled windows starting and ending.
+var (
+	watched     = map[string]*KillSwitch{}
+	watchOnce   sync.Once
+	announcedMu sync.Mutex
+	announced   = map[string]string{} // window key -> "started" or "ended"
+)
+
+// ponytail: one 1s ticker for the whole process, never stopped; fine for a plugin that lives as long as Traefik.
+func watch() {
+	for range time.Tick(time.Second) {
+		seenMu.Lock()
+		list := []*KillSwitch{}
+		for _, k := range watched {
+			list = append(list, k)
+		}
+		seenMu.Unlock()
+		for _, k := range list {
+			k.checkWindows(time.Now())
+		}
+	}
+}
+
+// checkWindows logs each window's start and end once. A window first seen already running
+// (e.g. after a Traefik restart) is logged as "active" instead of "started".
+func (k *KillSwitch) checkWindows(t time.Time) {
+	announcedMu.Lock()
+	defer announcedMu.Unlock()
+	for host, v := range k.load() {
+		e := parseEntry(v)
+		if !e.scheduled() {
+			continue
+		}
+		key := k.stateFile + "|" + host + "|" + e.from.Format(time.RFC3339) + "|" + e.to.Format(time.RFC3339)
+		switch {
+		case e.active(t) && announced[key] == "":
+			verb := "started"
+			if t.Sub(e.from) > 5*time.Second {
+				verb = "active since " + e.from.In(time.Local).Format(timeFmt)
+			}
+			logInfo("schedule %s for %s: %s until %s%s", verb, hostLabel(host), modeLabel(e.sMode, e.sTpl),
+				e.to.In(time.Local).Format(timeFmt+" MST"), e.createdLabel())
+			announced[key] = "started"
+		case !t.Before(e.to) && announced[key] == "started":
+			logInfo("schedule ended for %s: back to %s", hostLabel(host), modeLabel(e.mode, e.tpl))
+			announced[key] = "ended"
+		}
+	}
+}
+
+func hostLabel(host string) string {
+	if host == allHosts {
+		return "all sites"
+	}
+	return host
+}
+
+func modeLabel(mode, tpl string) string {
+	if tpl != "" {
+		return mode + " (page " + tpl + ")"
+	}
+	return mode
+}
+
+func (e entry) createdLabel() string {
+	if e.created.IsZero() {
+		return ""
+	}
+	l := " (created " + e.created.In(time.Local).Format(timeFmt)
+	if e.by != "" {
+		l += " by " + e.by
+	}
+	return l + ")"
+}
+
+// actor names who made an admin change, for the log: the SSO or basic-auth user, and the client IP.
+func actor(req *http.Request) (string, string) {
+	user := req.Header.Get("X-Authentik-Username")
+	if user == "" {
+		if u, _, ok := req.BasicAuth(); ok {
+			user = u
+		}
+	}
+	// Keep it a plain token: it's stored in the state value and written to logs.
+	user = strings.Map(func(r rune) rune {
+		if r == '|' || r == '"' || r == '\\' || r < ' ' {
+			return -1
+		}
+		return r
+	}, user)
+	ip := req.Header.Get("X-Real-Ip")
+	if ip == "" {
+		ip = req.RemoteAddr
+		if h, _, err := net.SplitHostPort(ip); err == nil {
+			ip = h
+		}
+	}
+	return user, ip
+}
+
 // entry is one state value: the normal mode, plus an optional scheduled window with its own mode.
 // Stored as "maint:downtime" or, with a window, "on|block|<from RFC3339>|<to RFC3339>".
 type entry struct {
 	mode, tpl   string
 	sMode, sTpl string
 	from, to    time.Time
+	created     time.Time // when the window was planned, and by whom (optional)
+	by          string
 }
 
 func parseEntry(v string) entry {
@@ -180,7 +293,7 @@ func parseEntry(v string) entry {
 	mode, tpl := splitMode(parts[0])
 	e.mode = mode
 	e.tpl = tpl
-	if len(parts) == 4 {
+	if len(parts) >= 4 {
 		from, err1 := time.Parse(time.RFC3339, parts[2])
 		to, err2 := time.Parse(time.RFC3339, parts[3])
 		if err1 == nil && err2 == nil {
@@ -190,6 +303,13 @@ func parseEntry(v string) entry {
 			e.from = from
 			e.to = to
 		}
+		if len(parts) == 6 {
+			created, err := time.Parse(time.RFC3339, parts[4])
+			if err == nil {
+				e.created = created
+			}
+			e.by = parts[5]
+		}
 	}
 	return e
 }
@@ -198,6 +318,9 @@ func (e entry) String() string {
 	v := joinMode(e.mode, e.tpl)
 	if e.scheduled() {
 		v += "|" + joinMode(e.sMode, e.sTpl) + "|" + e.from.Format(time.RFC3339) + "|" + e.to.Format(time.RFC3339)
+		if !e.created.IsZero() {
+			v += "|" + e.created.Format(time.RFC3339) + "|" + e.by
+		}
 	}
 	return v
 }
@@ -405,7 +528,13 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			fail(host + " is in excludeHosts and is never switched off")
 			return
 		}
+		user, ip := actor(req)
+		who := " from " + ip
+		if user != "" {
+			who = " by " + user + who
+		}
 		var fn func(e *entry)
+		var msg string
 		switch action {
 		case "schedule":
 			from, err1 := time.ParseInLocation("2006-01-02T15:04", req.PostForm.Get("from"), time.Local)
@@ -424,25 +553,33 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 				fail("the end is in the past")
 				return
 			}
+			created := now()
 			fn = func(e *entry) {
 				e.sMode = mode
 				e.sTpl = tpl
 				e.from = from
 				e.to = to
+				e.created = created
+				e.by = user
 			}
+			msg = "schedule created for " + hostLabel(host) + ": " + modeLabel(mode, tpl) + " from " +
+				from.Format(timeFmt) + " to " + to.Format(timeFmt+" MST") + who
 		case "unschedule":
 			fn = func(e *entry) { e.to = time.Time{} }
+			msg = "schedule cancelled for " + hostLabel(host) + who
 		default:
 			fn = func(e *entry) {
 				e.mode = mode
 				e.tpl = tpl
 			}
+			msg = hostLabel(host) + " set to " + modeLabel(mode, tpl) + who
 		}
 		if err := k.update(host, fn); err != nil {
 			log.Printf("killswitch %s: saving state: %v", k.name, err)
 			fail("Save failed: " + err.Error())
 			return
 		}
+		logInfo("%s", msg)
 		http.Redirect(rw, req, req.URL.Path, http.StatusSeeOther)
 	default:
 		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
@@ -565,7 +702,7 @@ func scheduleHTML(host string, e entry, tpls []string) string {
 			label += " · " + e.sTpl
 		}
 		b.WriteString(`<div class="sched">Scheduled <span class="pill ` + e.sMode + `">` + html.EscapeString(label) + `</span> <b>` +
-			e.from.In(time.Local).Format(timeFmt) + ` → ` + e.to.In(time.Local).Format(timeFmt) + `</b> (` + state + `)` +
+			e.from.In(time.Local).Format(timeFmt) + ` → ` + e.to.In(time.Local).Format(timeFmt) + `</b> (` + state + `)` + html.EscapeString(e.createdLabel()) +
 			`<form method="post"><input type="hidden" name="host" value="` + eh + `"><button name="action" value="unschedule">Cancel</button></form></div>`)
 	}
 	b.WriteString(`<details><summary>Schedule…</summary><form method="post"><input type="hidden" name="host" value="` + eh + `">` +
