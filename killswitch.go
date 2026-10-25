@@ -192,8 +192,60 @@ var (
 	watched     = map[string]*KillSwitch{}
 	watchOnce   sync.Once
 	announcedMu sync.Mutex
-	announced   = map[string]string{} // window key -> "started" or "ended"
+	announced   = map[string]time.Time{} // running occurrence (stateFile|host|start) -> its end
 )
+
+// histMu serializes appends to the history files.
+var histMu sync.Mutex
+
+const historyMax = 1000 // entries kept in <stateFile>.history
+
+// record logs an action and appends it to the history file shown on the admin page.
+func (k *KillSwitch) record(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	logInfo("%s", msg)
+	histMu.Lock()
+	defer histMu.Unlock()
+	path := k.stateFile + ".history"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Printf("killswitch %s: history: %v", k.name, err)
+		return
+	}
+	_, err = f.WriteString(time.Now().Format(time.RFC3339) + " " + msg + "\n")
+	_ = f.Close()
+	if err != nil {
+		log.Printf("killswitch %s: history: %v", k.name, err)
+		return
+	}
+	// Trim to the newest historyMax entries once the file is clearly over (~120 bytes per entry).
+	if fi, err := os.Stat(path); err == nil && fi.Size() > historyMax*240 {
+		lines := readHistory(path, historyMax)
+		var b strings.Builder
+		for i := len(lines) - 1; i >= 0; i-- {
+			b.WriteString(lines[i] + "\n")
+		}
+		if err := os.WriteFile(path+".tmp", []byte(b.String()), 0o644); err == nil {
+			_ = os.Rename(path+".tmp", path)
+		}
+	}
+}
+
+// readHistory returns up to n history lines, newest first.
+func readHistory(path string, n int) []string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	out := []string{}
+	for i := len(lines) - 1; i >= 0 && len(out) < n; i-- {
+		if lines[i] != "" {
+			out = append(out, lines[i])
+		}
+	}
+	return out
+}
 
 // ponytail: one 1s ticker for the whole process, never stopped; fine for a plugin that lives as long as Traefik.
 func watch() {
@@ -210,30 +262,53 @@ func watch() {
 	}
 }
 
-// checkWindows logs each window's start and end once. A window first seen already running
-// (e.g. after a Traefik restart) is logged as "active" instead of "started".
+// checkWindows logs each occurrence's start and end once and removes finished one-off windows.
+// An occurrence first seen already running (e.g. after a Traefik restart) is logged as "active since".
 func (k *KillSwitch) checkWindows(t time.Time) {
 	announcedMu.Lock()
 	defer announcedMu.Unlock()
-	for host, v := range k.load() {
+	state := k.load()
+	prefix := k.stateFile + "|"
+	endedNow := map[string]bool{}
+	for key, end := range announced {
+		if !strings.HasPrefix(key, prefix) || t.Before(end) {
+			continue
+		}
+		host := strings.Split(strings.TrimPrefix(key, prefix), "|")[0]
+		e := parseEntry(state[host])
+		k.record("schedule ended for %s: back to %s", hostLabel(host), modeLabel(e.mode, e.tpl))
+		delete(announced, key)
+		endedNow[host] = true
+	}
+	for host, v := range state {
 		e := parseEntry(v)
 		if !e.scheduled() {
 			continue
 		}
-		key := k.stateFile + "|" + host + "|" + e.from.Format(time.RFC3339) + "|" + e.to.Format(time.RFC3339)
-		switch {
-		case e.active(t) && announced[key] == "":
-			verb := "started"
-			if t.Sub(e.from) > 5*time.Second {
-				verb = "active since " + e.from.In(time.Local).Format(timeFmt)
+		if e.ended(t) {
+			// One-off window done: remove it so it disappears from the admin page.
+			if err := k.update(host, func(*entry) {}); err != nil {
+				log.Printf("killswitch %s: removing finished schedule: %v", k.name, err)
+				continue
 			}
-			logInfo("schedule %s for %s: %s until %s%s", verb, hostLabel(host), modeLabel(e.sMode, e.sTpl),
-				e.to.In(time.Local).Format(timeFmt+" MST"), e.createdLabel())
-			announced[key] = "started"
-		case !t.Before(e.to) && announced[key] == "started":
-			logInfo("schedule ended for %s: back to %s", hostLabel(host), modeLabel(e.mode, e.tpl))
-			announced[key] = "ended"
+			if !endedNow[host] {
+				k.record("schedule for %s (%s %s) had already ended; removed",
+					hostLabel(host), modeLabel(e.sMode, e.sTpl), e.when())
+			}
+			continue
 		}
+		s, end := e.window(t)
+		key := prefix + host + "|" + s.Format(time.RFC3339)
+		if _, ok := announced[key]; ok || t.Before(s) || !t.Before(end) {
+			continue
+		}
+		verb := "started"
+		if t.Sub(s) > 5*time.Second {
+			verb = "active since " + s.In(time.Local).Format(timeFmt)
+		}
+		k.record("schedule %s for %s: %s until %s%s", verb, hostLabel(host), modeLabel(e.sMode, e.sTpl),
+			end.In(time.Local).Format(timeFmt+" MST"), e.createdLabel())
+		announced[key] = end
 	}
 }
 
@@ -288,13 +363,15 @@ func actor(req *http.Request) (string, string) {
 }
 
 // entry is one state value: the normal mode, plus an optional scheduled window with its own mode.
-// Stored as "maint:downtime" or, with a window, "on|block|<from RFC3339>|<to RFC3339>".
+// Stored as "maint:downtime" or, with a window, "on|block|<from>|<to>[|<created>|<by>[|daily|weekly]]"
+// (times RFC3339). A repeating window's from/to are its first occurrence.
 type entry struct {
 	mode, tpl   string
 	sMode, sTpl string
 	from, to    time.Time
 	created     time.Time // when the window was planned, and by whom (optional)
 	by          string
+	repeat      string // "", "daily" or "weekly"
 }
 
 func parseEntry(v string) entry {
@@ -314,12 +391,15 @@ func parseEntry(v string) entry {
 			e.from = from
 			e.to = to
 		}
-		if len(parts) == 6 {
+		if len(parts) >= 6 {
 			created, err := time.Parse(time.RFC3339, parts[4])
 			if err == nil {
 				e.created = created
 			}
 			e.by = parts[5]
+		}
+		if len(parts) >= 7 && repeatDays(parts[6]) > 0 {
+			e.repeat = parts[6]
 		}
 	}
 	return e
@@ -329,8 +409,15 @@ func (e entry) String() string {
 	v := joinMode(e.mode, e.tpl)
 	if e.scheduled() {
 		v += "|" + joinMode(e.sMode, e.sTpl) + "|" + e.from.Format(time.RFC3339) + "|" + e.to.Format(time.RFC3339)
-		if !e.created.IsZero() {
-			v += "|" + e.created.Format(time.RFC3339) + "|" + e.by
+		if !e.created.IsZero() || e.repeat != "" {
+			created := ""
+			if !e.created.IsZero() {
+				created = e.created.Format(time.RFC3339)
+			}
+			v += "|" + created + "|" + e.by
+		}
+		if e.repeat != "" {
+			v += "|" + e.repeat
 		}
 	}
 	return v
@@ -338,14 +425,74 @@ func (e entry) String() string {
 
 func (e entry) scheduled() bool { return !e.to.IsZero() }
 
+func repeatDays(repeat string) int {
+	switch repeat {
+	case "daily":
+		return 1
+	case "weekly":
+		return 7
+	}
+	return 0
+}
+
+// window returns the occurrence running at t, or else the next one. Repeats keep the wall-clock time
+// across daylight saving changes (AddDate in local time).
+func (e entry) window(t time.Time) (time.Time, time.Time) {
+	days := repeatDays(e.repeat)
+	if days == 0 || t.Before(e.from) {
+		return e.from, e.to
+	}
+	dur := e.to.Sub(e.from)
+	first := e.from.In(time.Local)
+	n := int(t.Sub(first).Hours() / 24 / float64(days))
+	for n > 0 && first.AddDate(0, 0, n*days).After(t) {
+		n--
+	}
+	for !first.AddDate(0, 0, (n+1)*days).After(t) {
+		n++
+	}
+	start := first.AddDate(0, 0, n*days)
+	if t.Before(start.Add(dur)) {
+		return start, start.Add(dur)
+	}
+	next := first.AddDate(0, 0, (n+1)*days)
+	return next, next.Add(dur)
+}
+
 func (e entry) active(t time.Time) bool {
-	return e.scheduled() && !t.Before(e.from) && t.Before(e.to)
+	if !e.scheduled() {
+		return false
+	}
+	s, end := e.window(t)
+	return !t.Before(s) && t.Before(end)
+}
+
+// ended is true for a one-off window that is over; repeating windows never end.
+func (e entry) ended(t time.Time) bool {
+	return e.scheduled() && e.repeat == "" && !t.Before(e.to)
+}
+
+// when describes the window: "from Mon 26 Oct 22:00 to Tue 27 Oct 02:00 CET", "every day 02:00–02:30",
+// "every Sunday 03:00–04:00".
+func (e entry) when() string {
+	f, to := e.from.In(time.Local), e.to.In(time.Local)
+	switch e.repeat {
+	case "daily":
+		return "every day " + f.Format("15:04") + "–" + to.Format("15:04")
+	case "weekly":
+		if f.Weekday() == to.Weekday() {
+			return "every " + f.Format("Monday 15:04") + "–" + to.Format("15:04")
+		}
+		return "every " + f.Format("Monday 15:04") + " – " + to.Format("Monday 15:04")
+	}
+	return "from " + f.Format(timeFmt) + " to " + to.Format(timeFmt+" MST")
 }
 
 // effective returns the mode and template in force at t, and the window's end while one is active.
 func (e entry) effective(t time.Time) (string, string, time.Time) {
 	if e.active(t) {
-		return e.sMode, e.sTpl, e.to
+		_, end := e.window(t)
+		return e.sMode, e.sTpl, end
 	}
 	return e.mode, e.tpl, time.Time{}
 }
@@ -480,7 +627,7 @@ func (k *KillSwitch) update(host string, fn func(e *entry)) error {
 	}
 	e := parseEntry(state[host])
 	fn(&e)
-	if e.scheduled() && !now().Before(e.to) {
+	if e.ended(now()) {
 		e.to = time.Time{}
 	}
 	if v := e.String(); v == modeOn && host != allHosts {
@@ -717,6 +864,10 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 	case http.MethodGet, http.MethodHead:
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		rw.Header().Set("Cache-Control", "no-store")
+		if req.URL.Query().Get("view") == "history" {
+			_, _ = rw.Write([]byte(k.renderHistory()))
+			return
+		}
 		_, _ = rw.Write([]byte(k.renderAdmin(req.URL.Query().Get("err"), req.URL.Query().Get("warn"))))
 	case http.MethodPost:
 		if !sameOrigin(req) {
@@ -762,7 +913,12 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 		case "schedule":
 			from, err1 := time.ParseInLocation("2006-01-02T15:04", req.PostForm.Get("from"), time.Local)
 			to, err2 := time.ParseInLocation("2006-01-02T15:04", req.PostForm.Get("to"), time.Local)
+			repeat := req.PostForm.Get("repeat")
+			days := repeatDays(repeat)
 			switch {
+			case repeat != "" && days == 0:
+				fail("unknown repeat " + repeat)
+				return
 			case err1 != nil || err2 != nil:
 				fail("enter both a start and an end date and time")
 				return
@@ -772,7 +928,10 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			case !to.After(from):
 				fail("the end must be after the start")
 				return
-			case !to.After(now()):
+			case days > 0 && to.Sub(from) >= time.Duration(days)*24*time.Hour:
+				fail("a " + repeat + " window must be shorter than its repeat interval")
+				return
+			case days == 0 && !to.After(now()):
 				fail("the end is in the past")
 				return
 			}
@@ -784,9 +943,10 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 				e.to = to
 				e.created = created
 				e.by = user
+				e.repeat = repeat
 			}
-			msg = "schedule created for " + hostLabel(host) + ": " + modeLabel(mode, tpl) + " from " +
-				from.Format(timeFmt) + " to " + to.Format(timeFmt+" MST") + who
+			planned := entry{from: from, to: to, repeat: repeat}
+			msg = "schedule created for " + hostLabel(host) + ": " + modeLabel(mode, tpl) + " " + planned.when() + who
 		case "unschedule":
 			fn = func(e *entry) { e.to = time.Time{} }
 			msg = "schedule cancelled for " + hostLabel(host) + who
@@ -802,7 +962,7 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			fail("Save failed: " + err.Error())
 			return
 		}
-		logInfo("%s", msg)
+		k.record("%s", msg)
 		target := req.URL.Path
 		if warn != "" {
 			target += "?warn=" + url.QueryEscape(warn)
@@ -874,6 +1034,9 @@ input{font:inherit;padding:.3rem .6rem;border-radius:8px;border:1px solid var(--
 .err{background:var(--err);border-radius:8px;padding:.6rem 1rem;color:var(--text)}
 .warn{background:color-mix(in srgb,var(--maint) 16%,transparent);border-radius:8px;padding:.6rem 1rem;color:var(--text)}
 .host small.bad{color:var(--block)}
+.top{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}.top a{color:var(--text)}
+ol.hist{list-style:none;margin:0;padding:0}ol.hist li{display:flex;gap:1rem;padding:.5rem 1rem;border-top:1px solid var(--border)}
+ol.hist li:first-child{border-top:0}ol.hist time{flex:0 0 9.5rem;color:var(--muted);font-variant-numeric:tabular-nums}
 details.np summary h2{display:inline;font-size:1.05rem}details.np{margin-top:2rem}
 ul.excl{margin:0;padding:.6rem 1rem .6rem 2rem;color:var(--muted)}
 .sched{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .75rem;font-size:.9rem;color:var(--muted)}
@@ -922,24 +1085,52 @@ func scheduleHTML(host string, e entry, tpls []string) string {
 	var b strings.Builder
 	eh := html.EscapeString(host)
 	t := now()
-	if e.scheduled() {
+	if e.scheduled() && !e.ended(t) {
+		s, end := e.window(t)
 		state := "upcoming"
 		if e.active(t) {
-			state = "active"
+			state = "active until " + end.In(time.Local).Format(timeFmt)
+		} else if e.repeat != "" {
+			state = "next " + s.In(time.Local).Format(timeFmt)
 		}
 		label := e.sMode
 		if e.sTpl != "" {
 			label += " · " + e.sTpl
 		}
 		b.WriteString(`<div class="sched">Scheduled <span class="pill ` + e.sMode + `">` + html.EscapeString(label) + `</span> <b>` +
-			e.from.In(time.Local).Format(timeFmt) + ` → ` + e.to.In(time.Local).Format(timeFmt) + `</b> (` + state + `)` + html.EscapeString(e.createdLabel()) +
+			html.EscapeString(e.when()) + `</b> (` + state + `)` + html.EscapeString(e.createdLabel()) +
 			`<form method="post"><input type="hidden" name="host" value="` + eh + `"><button name="action" value="unschedule">Cancel</button></form></div>`)
 	}
 	b.WriteString(`<details><summary>Schedule…</summary><form method="post"><input type="hidden" name="host" value="` + eh + `">` +
 		`<input type="hidden" name="action" value="schedule"><select name="mode" aria-label="Scheduled mode"><option value="maint">maint</option><option value="block">block</option></select>` +
 		templateSelect(tpls, "") +
 		`<label>from <input type="datetime-local" name="from" required></label><label>to <input type="datetime-local" name="to" required></label>` +
+		`<select name="repeat" aria-label="Repeat"><option value="">once</option><option value="daily">daily</option><option value="weekly">weekly</option></select>` +
 		`<button>Schedule</button></form></details>`)
+	return b.String()
+}
+
+func (k *KillSwitch) renderHistory() string {
+	var b strings.Builder
+	b.WriteString(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kill switch history</title>` + adminStyle + `<main><div class="top"><h1>History</h1><a href="?">← Kill switch</a></div>
+<p>Newest first. Kept in <code>` + html.EscapeString(filepath.Base(k.stateFile)) + `.history</code> (last ` + strconv.Itoa(historyMax) + ` entries).</p><div class="card"><ol class="hist">`)
+	lines := readHistory(k.stateFile+".history", historyMax)
+	for _, l := range lines {
+		ts, msg := l, ""
+		if i := strings.Index(l, " "); i > 0 {
+			ts = l[:i]
+			msg = l[i+1:]
+		}
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			ts = t.In(time.Local).Format(timeFmt)
+		}
+		b.WriteString(`<li><time>` + html.EscapeString(ts) + `</time><span>` + html.EscapeString(msg) + `</span></li>`)
+	}
+	if len(lines) == 0 {
+		b.WriteString(`<li><span>Nothing yet.</span></li>`)
+	}
+	b.WriteString(`</ol></div></main></html>`)
 	return b.String()
 }
 
@@ -994,7 +1185,7 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string) string {
 
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kill switch</title>` + adminStyle + `<main><h1>Kill switch</h1>
+<title>Kill switch</title>` + adminStyle + `<main><div class="top"><h1>Kill switch</h1><a href="?view=history">History</a></div>
 <p><b>on</b> serves the site, <b>maint</b> shows the maintenance page (503), <b>block</b> refuses every request (403).</p>`)
 	if len(tpls) > 0 {
 		b.WriteString(`<p>Pick a page in the list, then click <b>maint</b>. Clicking <b>maint</b> again switches a site to the newly picked page.</p>`)

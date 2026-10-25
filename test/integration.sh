@@ -116,6 +116,19 @@ expect "b passes before window" "$(code_within b.lan 418)" 418
 loc() { curl -s -o /dev/null -w '%{redirect_url}' "$@" http://127.0.0.1:18081/; }
 case "$(loc -d 'host=c.lan&mode=block')" in *unprotected%40file*) echo "ok   unprotected host c.lan refused";; *) echo "FAIL c.lan not refused"; exit 1;; esac
 case "$(loc -d 'host=typo.lan&mode=block')" in *No+Traefik+router*) echo "ok   unknown host refused";; *) echo "FAIL typo.lan not refused"; exit 1;; esac
+FROM=$(date -d '+1 day' +%Y-%m-%dT03:00); TO=$(date -d '+1 day' +%Y-%m-%dT04:00)
+expect "schedule a weekly"   "$(post -d "host=a.lan&action=schedule&mode=maint&repeat=weekly&from=$FROM&to=$TO")" 303
+curl -s http://127.0.0.1:18081/ | grep -q "every $(date -d '+1 day' +%A) 03:00–04:00</b> (next" && echo "ok   weekly window shown with next run" || { echo "FAIL weekly window"; exit 1; }
+# a one-off that already ended is removed by the background check within ~2s
+python3 - "$STATE" <<'PY'
+import json,sys,datetime,os
+p=sys.argv[1]; s=json.load(open(p)); tz=datetime.datetime.now().astimezone().tzinfo
+f=lambda m: (datetime.datetime.now(tz)-datetime.timedelta(minutes=m)).isoformat(timespec="seconds")
+s["old.lan"]="on|block|%s|%s" % (f(30), f(10)); json.dump(s, open(p+".tmp","w")); os.rename(p+".tmp", p)
+PY
+for _ in $(seq 15); do grep -q old.lan "$STATE" || break; sleep 0.2; done
+grep -q old.lan "$STATE" && { echo "FAIL ended window not removed"; exit 1; } || echo "ok   ended window removed automatically"
+curl -s 'http://127.0.0.1:18081/?view=history' | grep -q 'schedule for old.lan' && echo "ok   history page shows removal" || { echo "FAIL history page"; exit 1; }
 PAGE=$(curl -s http://127.0.0.1:18081/)
 echo "$PAGE" | grep -q '<li>c.lan <small>(unprotected@file)' && echo "ok   admin lists c.lan as not protected" || { echo "FAIL c.lan not listed as unprotected"; exit 1; }
 echo "$PAGE" | grep -q '(upcoming)' && echo "ok   admin shows upcoming window" || { echo "FAIL upcoming window not shown"; exit 1; }

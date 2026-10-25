@@ -3,6 +3,8 @@ package traefik_killswitch
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -450,7 +452,7 @@ func TestLogging(t *testing.T) {
 
 	// a window first seen while already running (Traefik restarted mid-window)
 	announcedMu.Lock()
-	announced = map[string]string{}
+	announced = map[string]time.Time{}
 	announcedMu.Unlock()
 	k.checkWindows(from.Add(30 * time.Minute))
 	expectLog("KILL-SWITCH: schedule active since " + from.Format(timeFmt) + " for b.lan")
@@ -576,5 +578,143 @@ func TestUnseenHostWarnsWithoutAPI(t *testing.T) {
 	admin.ServeHTTP(rec, req)
 	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "warn=") || strings.Contains(loc, "err=") {
 		t.Fatalf("want a warning, got %q", loc)
+	}
+}
+
+func TestRepeatingWindow(t *testing.T) {
+	// Every Sunday 03:00–04:00 local, first on Sun 18 Oct 2026; Europe drops DST on Sun 25 Oct.
+	loc := time.Local
+	e := parseEntry(entry{mode: "on", sMode: "block", repeat: "weekly",
+		from: time.Date(2026, 10, 18, 3, 0, 0, 0, loc), to: time.Date(2026, 10, 18, 4, 0, 0, 0, loc)}.String())
+	if e.repeat != "weekly" || e.when() != "every Sunday 03:00–04:00" {
+		t.Fatalf("round trip: %+v %q", e, e.when())
+	}
+	for _, c := range []struct {
+		at     time.Time
+		active bool
+		next   string
+	}{
+		{time.Date(2026, 10, 18, 2, 59, 0, 0, loc), false, "Sun 18 Oct 03:00"},
+		{time.Date(2026, 10, 18, 3, 30, 0, 0, loc), true, "Sun 18 Oct 03:00"},
+		{time.Date(2026, 10, 20, 12, 0, 0, 0, loc), false, "Sun 25 Oct 03:00"},
+		{time.Date(2026, 10, 25, 3, 30, 0, 0, loc), true, "Sun 25 Oct 03:00"},
+		{time.Date(2026, 10, 25, 4, 0, 0, 0, loc), false, "Sun 01 Nov 03:00"},
+		{time.Date(2027, 4, 4, 3, 10, 0, 0, loc), true, "Sun 04 Apr 03:00"},
+	} {
+		s, end := e.window(c.at)
+		if e.active(c.at) != c.active || s.Format(timeFmt) != c.next || end.Sub(s) != time.Hour {
+			t.Errorf("at %s: active=%v window %s–%s, want active=%v start %s",
+				c.at.Format(timeFmt), e.active(c.at), s.Format(timeFmt), end.Format(timeFmt), c.active, c.next)
+		}
+		if e.ended(c.at) {
+			t.Errorf("a repeating window never ends")
+		}
+	}
+	daily := entry{sMode: "maint", repeat: "daily",
+		from: time.Date(2026, 10, 1, 23, 30, 0, 0, loc), to: time.Date(2026, 10, 2, 0, 30, 0, 0, loc)}
+	if !daily.active(time.Date(2026, 12, 24, 0, 10, 0, 0, loc)) || daily.active(time.Date(2026, 12, 24, 0, 31, 0, 0, loc)) {
+		t.Error("daily window across midnight")
+	}
+}
+
+func TestHistoryCleanupAndRepeats(t *testing.T) {
+	var buf bytes.Buffer
+	infoLog = log.New(&buf, "", 0)
+	defer func() { infoLog = log.New(os.Stdout, "", 0) }()
+	gate, admin, stateFile := newPair(t)
+	k := gate.(*KillSwitch)
+	clock := time.Date(2026, 11, 2, 9, 0, 0, 0, time.Local)
+	now = func() time.Time { return clock }
+	defer func() { now = time.Now }()
+	announcedMu.Lock()
+	announced = map[string]time.Time{}
+	announcedMu.Unlock()
+
+	post := func(form url.Values) string {
+		req := httptest.NewRequest(http.MethodPost, "http://ks.lan/", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.SetBasicAuth("bob", "x")
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		return rec.Header().Get("Location")
+	}
+	// one-off 10:00–11:00 and a daily 02:00–03:00 repeat
+	if loc := post(url.Values{"host": {"a.lan"}, "action": {"schedule"}, "mode": {"block"}, "from": {"2026-11-02T10:00"}, "to": {"2026-11-02T11:00"}}); strings.Contains(loc, "err=") {
+		t.Fatal(loc)
+	}
+	if loc := post(url.Values{"host": {"b.lan"}, "action": {"schedule"}, "mode": {"maint"}, "repeat": {"daily"}, "from": {"2026-11-01T02:00"}, "to": {"2026-11-01T03:00"}}); strings.Contains(loc, "err=") {
+		t.Fatalf("repeating window starting in the past must be accepted: %s", loc)
+	}
+	if loc := post(url.Values{"host": {"b.lan"}, "action": {"schedule"}, "mode": {"maint"}, "repeat": {"daily"}, "from": {"2026-11-01T02:00"}, "to": {"2026-11-02T03:00"}}); !strings.Contains(loc, "err=") {
+		t.Fatal("daily window longer than a day accepted")
+	}
+	tick := func(at time.Time) {
+		clock = at
+		k.checked = time.Time{}
+		k.checkWindows(at)
+	}
+	day := func(d, h, m int) time.Time { return time.Date(2026, 11, d, h, m, 0, 0, time.Local) }
+	tick(day(2, 10, 0))
+	tick(day(2, 11, 0)) // one-off ends: logged and removed
+	b, _ := os.ReadFile(stateFile)
+	if strings.Contains(string(b), "a.lan") {
+		t.Fatalf("finished one-off window not removed: %s", b)
+	}
+	tick(day(3, 2, 0))
+	tick(day(3, 3, 0))
+	tick(day(4, 2, 0))
+	tick(day(4, 2, 30)) // same occurrence: no second "started"
+	tick(day(4, 3, 0))
+	b, _ = os.ReadFile(stateFile)
+	if !strings.Contains(string(b), "|daily") {
+		t.Fatalf("repeating window must stay: %s", b)
+	}
+	if n := strings.Count(buf.String(), "schedule started for b.lan"); n != 2 {
+		t.Fatalf("want 2 daily starts, got %d:\n%s", n, buf.String())
+	}
+	if n := strings.Count(buf.String(), "schedule ended for b.lan"); n != 2 {
+		t.Fatalf("want 2 daily ends, got %d", n)
+	}
+
+	// a one-off that ended while nothing was watching is still removed, with a note
+	b, _ = os.ReadFile(stateFile)
+	gone := entry{mode: "on", sMode: "block", from: day(5, 1, 0), to: day(5, 2, 0)}
+	b = []byte(strings.Replace(string(b), "{", `{"c.lan":"`+gone.String()+`",`, 1))
+	if err := os.WriteFile(stateFile, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tick(day(6, 9, 0))
+	if !strings.Contains(buf.String(), "schedule for c.lan (block from Thu 05 Nov 01:00") || !strings.Contains(buf.String(), "had already ended; removed") {
+		t.Fatalf("missing removal note:\n%s", buf.String())
+	}
+
+	// history page, newest first
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/?view=history", nil))
+	page := rec.Body.String()
+	first := strings.Index(page, "schedule created for a.lan: block from Mon 02 Nov 10:00")
+	last := strings.Index(page, "schedule for c.lan")
+	if first < 0 || last < 0 || last > first || !strings.Contains(page, "by bob") {
+		t.Fatalf("history page wrong (created idx %d, removal idx %d)", first, last)
+	}
+	// admin page shows the next daily run and never an ended one-off
+	rec = httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
+	if !strings.Contains(rec.Body.String(), "every day 02:00–03:00</b> (next Sat 07 Nov 02:00)") {
+		t.Fatal("admin page doesn't show next daily run")
+	}
+}
+
+func TestHistoryTrim(t *testing.T) {
+	_, admin, stateFile := newPair(t)
+	k := admin.(*KillSwitch)
+	infoLog = log.New(io.Discard, "", 0)
+	defer func() { infoLog = log.New(os.Stdout, "", 0) }()
+	for i := 0; i < historyMax+300; i++ {
+		k.record("entry %d %s", i, strings.Repeat("x", 200))
+	}
+	lines := readHistory(stateFile+".history", 10*historyMax)
+	if len(lines) > historyMax+300 || len(lines) < historyMax || !strings.Contains(lines[0], fmt.Sprintf("entry %d ", historyMax+299)) {
+		t.Fatalf("got %d lines, newest %q", len(lines), lines[0][:40])
 	}
 }
