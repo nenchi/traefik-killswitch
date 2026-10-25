@@ -1,6 +1,7 @@
 displayName: Kill Switch
 type: middleware
-iconPath: .assets/icon.svg
+iconPath: .assets/icon.png
+bannerPath: .assets/banner.png
 
 import: github.com/nenchi/traefik-killswitch
 

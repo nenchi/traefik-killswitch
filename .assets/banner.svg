@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <rect width="1280" height="640" fill="#14171c"/>
+  <rect x="40" y="40" width="1200" height="560" rx="28" fill="#1d2128" stroke="#2c323b" stroke-width="2"/>
+  <!-- icon (same as icon.svg), 224px -->
+  <g transform="translate(120 208) scale(3.5)">
+    <rect width="64" height="64" rx="12" fill="#c62828"/>
+    <path d="M32 12v20" stroke="#fff" stroke-width="6" stroke-linecap="round"/>
+    <path d="M21 20a16 16 0 1 0 22 0" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round"/>
+  </g>
+  <g font-family="DejaVu Sans, Helvetica, Arial, sans-serif">
+    <text x="420" y="268" fill="#e8eaee" font-size="76" font-weight="bold">Traefik Kill Switch</text>
+    <text x="422" y="330" fill="#9aa3b0" font-size="32">Take any site offline in one click:</text>
+    <text x="422" y="374" fill="#9aa3b0" font-size="32">maintenance page or block, scheduled or now.</text>
+    <!-- mode pills, colors from the admin page -->
+    <g font-size="26" font-weight="bold" letter-spacing="1.5">
+      <rect x="422" y="420" width="104" height="48" rx="24" fill="#3fb950" fill-opacity="0.16"/>
+      <text x="474" y="453" fill="#3fb950" text-anchor="middle">ON</text>
+      <rect x="546" y="420" width="156" height="48" rx="24" fill="#f0a04b" fill-opacity="0.16"/>
+      <text x="624" y="453" fill="#f0a04b" text-anchor="middle">MAINT</text>
+      <rect x="722" y="420" width="148" height="48" rx="24" fill="#ff6b6b" fill-opacity="0.16"/>
+      <text x="796" y="453" fill="#ff6b6b" text-anchor="middle">BLOCK</text>
+    </g>
+  </g>
+</svg>

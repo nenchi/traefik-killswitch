@@ -1,5 +1,7 @@
 # Traefik Kill Switch
 
+![Traefik Kill Switch](.assets/banner.png)
+
 > **Beta.** Tested against Traefik v3.7. Feedback and issues welcome.
 
 A Traefik middleware plugin that does nothing until you need it. When you need it, a web page lets you
