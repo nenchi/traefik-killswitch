@@ -102,7 +102,7 @@ Or add it to individual routers, e.g. with the Docker label
 |-------------------|-------------------------|---------------------------------------------------------------------|
 | `stateFile`       | `/data/killswitch.json` | Shared JSON state. Must be writable for the admin instance.         |
 | `admin`           | `false`                 | Serve the web page instead of gating. Never forwards to a backend.  |
-| `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Read once at startup.       |
+| `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Edits apply immediately.   |
 | `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider.  |
 
 You can also edit the state file by hand or from a script:
@@ -118,7 +118,8 @@ Start from [`examples/maintenance.html`](examples/maintenance.html): copy it nex
 
 - **Keep it one self-contained file.** While a site is in maintenance, every request to it returns this
   page, including requests for its CSS, images and fonts. Inline your styles, and use inline SVG or `data:` URIs for images.
-- Traefik reads the file at startup, so restart Traefik after editing it.
+- Edits apply immediately, with no restart. If the file is missing or unreadable, the built-in page
+  is served and an error is logged, so a bad path can't break your sites.
 
 ## Security
 

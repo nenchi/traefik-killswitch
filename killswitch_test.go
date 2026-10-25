@@ -140,8 +140,21 @@ func TestCustomMaintenancePage(t *testing.T) {
 	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "Back at 18:00") {
 		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
 	}
-	if _, err := New(context.Background(), nil, &Config{StateFile: stateFile, MaintenanceFile: filepath.Join(dir, "missing")}, "x"); err == nil {
-		t.Fatal("missing maintenanceFile should fail at startup")
+	if err := os.WriteFile(page, []byte("<h1>Back at 19:00</h1>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://a.lan/", nil))
+	if !strings.Contains(rec.Body.String(), "Back at 19:00") {
+		t.Fatalf("edit not picked up: %q", rec.Body.String())
+	}
+	if err := os.Remove(page); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://a.lan/", nil))
+	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "Under maintenance") {
+		t.Fatalf("missing file should fall back to built-in page: %d %q", rec.Code, rec.Body.String())
 	}
 }
 

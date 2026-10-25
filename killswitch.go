@@ -57,7 +57,7 @@ type KillSwitch struct {
 	name      string
 	stateFile string
 	admin     bool
-	maintPage []byte
+	maintFile string
 	exclude   map[string]bool
 
 	mu      sync.Mutex
@@ -72,19 +72,11 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 	if config.StateFile == "" {
 		return nil, fmt.Errorf("stateFile must be set")
 	}
-	page := []byte(defaultMaintPage)
-	if config.MaintenanceFile != "" {
-		b, err := os.ReadFile(config.MaintenanceFile)
-		if err != nil {
-			return nil, fmt.Errorf("reading maintenanceFile: %w", err)
-		}
-		page = b
-	}
 	exclude := map[string]bool{}
 	for _, h := range config.ExcludeHosts {
 		exclude[strings.ToLower(strings.TrimSpace(h))] = true
 	}
-	return &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintPage: page, exclude: exclude}, nil
+	return &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile, exclude: exclude}, nil
 }
 
 func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -108,12 +100,25 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Cache-Control", "no-store")
 		rw.Header().Set("Retry-After", "300")
 		rw.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = rw.Write(k.maintPage)
+		_, _ = rw.Write(k.maintPage())
 	case modeBlock:
 		http.Error(rw, "Forbidden", http.StatusForbidden)
 	default:
 		k.next.ServeHTTP(rw, req)
 	}
+}
+
+// maintPage reads maintenanceFile on every maintenance response, so edits apply without a restart.
+// A missing or unreadable file falls back to the built-in page: it must never break the middleware.
+func (k *KillSwitch) maintPage() []byte {
+	if k.maintFile != "" {
+		b, err := os.ReadFile(k.maintFile)
+		if err == nil {
+			return b
+		}
+		log.Printf("killswitch %s: %v (serving built-in page)", k.name, err)
+	}
+	return []byte(defaultMaintPage)
 }
 
 // modeFor returns the effective mode: a non-"on" global switch wins over the per-host one.
