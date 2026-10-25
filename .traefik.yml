@@ -1,0 +1,10 @@
+displayName: Kill Switch
+type: middleware
+iconPath: .assets/icon.svg
+
+import: github.com/nenchi/traefik-killswitch
+
+summary: 'Per-host kill switch with a web UI: put any site (or all of them) into maintenance mode or block it instantly, without restarting Traefik.'
+
+testData:
+  stateFile: /tmp/killswitch.json

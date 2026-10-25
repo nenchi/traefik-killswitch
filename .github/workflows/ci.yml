@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  TRAEFIK_VERSION: v3.7.15
+  YAEGI_VERSION: v0.16.1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: go/src/github.com/nenchi/traefik-killswitch
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Go tests
+        working-directory: go/src/github.com/nenchi/traefik-killswitch
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test -race -count=1 ./...
+      # Traefik runs plugins in the Yaegi interpreter, which has bugs plain Go doesn't. Test there too.
+      - name: Yaegi tests
+        working-directory: go/src/github.com/nenchi/traefik-killswitch
+        env:
+          GOPATH: ${{ github.workspace }}/go
+        run: |
+          go install github.com/traefik/yaegi/cmd/yaegi@${YAEGI_VERSION}
+          "$(go env GOPATH)/bin/yaegi" test -v .
+      - name: Integration test with real Traefik
+        working-directory: go/src/github.com/nenchi/traefik-killswitch
+        run: |
+          curl -sSL "https://github.com/traefik/traefik/releases/download/${TRAEFIK_VERSION}/traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz" | tar xz traefik
+          TRAEFIK=$PWD/traefik test/integration.sh
