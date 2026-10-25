@@ -788,3 +788,14 @@ func TestMaintPageShowsWindowEnd(t *testing.T) {
 		t.Fatalf("manual maint: got %q", b)
 	}
 }
+
+func TestAdminFavicon(t *testing.T) {
+	_, admin, _ := newPair(t)
+	for _, path := range []string{"/", "/?view=history"} {
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan"+path, nil))
+		if !strings.Contains(rec.Body.String(), `<link rel="icon" href="data:image/svg+xml,`) {
+			t.Fatalf("%s: no favicon", path)
+		}
+	}
+}

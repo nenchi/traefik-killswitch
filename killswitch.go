@@ -1028,7 +1028,10 @@ func excludedHosts() map[string]bool {
 	return all
 }
 
-const adminStyle = `<style>
+// favicon is .assets/icon.svg inline, so the admin tab shows the kill switch icon without serving a file.
+const favicon = `<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%23c62828'/><path d='M32 12v20' stroke='%23fff' stroke-width='6' stroke-linecap='round'/><path d='M21 20a16 16 0 1 0 22 0' fill='none' stroke='%23fff' stroke-width='6' stroke-linecap='round'/></svg>">`
+
+const adminStyle = favicon + `<style>
 :root{color-scheme:light dark;--bg:#f5f6f8;--card:#fff;--text:#1d2330;--muted:#5d6675;--border:#e1e4e9;
 --on:#1a7f37;--maint:#b35900;--block:#c62828;--btn:#eef0f3;--btn-text:#1d2330;--err:#fde7e7}
 @media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--text:#e8eaee;--muted:#9aa3b0;--border:#2c323b;
