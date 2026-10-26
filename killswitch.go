@@ -54,8 +54,9 @@ func CreateConfig() *Config {
 
 // ponytail: package-level, shared by all instances in Traefik's interpreter; lost on restart.
 var (
-	seenMu sync.Mutex // guards seen and excludedBy
-	seen   = map[string]bool{}
+	seenMu  sync.Mutex // guards seen and excludedBy
+	seen    = map[string]bool{}
+	maxSeen = 1000
 	// excludedBy holds each gate middleware's excludeHosts, keyed by middleware name, so the admin
 	// page (a separate instance with its own config) can show which hosts are never switched off.
 	excludedBy = map[string][]string{}
@@ -121,9 +122,15 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		k.next.ServeHTTP(rw, req)
 		return
 	}
-	seenMu.Lock()
-	seen[host] = true
-	seenMu.Unlock()
+	// IP literals (scanners, direct hits on the public IP) aren't sites you can switch.
+	// ponytail: capped so junk Host headers on catch-all routers can't grow it forever
+	if !isIP(host) {
+		seenMu.Lock()
+		if len(seen) < maxSeen {
+			seen[host] = true
+		}
+		seenMu.Unlock()
+	}
 
 	mode, tpl, until := k.modeFor(host)
 	switch mode {
@@ -873,6 +880,9 @@ func (k *KillSwitch) checkHost(host, mode, action string) (string, string) {
 	if host == allHosts || action == "unschedule" || (action == "" && mode == modeOn) {
 		return "", ""
 	}
+	if isIP(host) {
+		return host + " is an IP address, not a site. Switch the host names instead.", ""
+	}
 	routes, err := k.hostRoutes()
 	if routes != nil && err == nil {
 		r, ok := routes[host]
@@ -1293,11 +1303,14 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 		}
 	}
 	sort.Strings(unprotected)
-	seenMu.Lock()
-	for h := range seen {
-		hosts[h] = true
+	// With the API, routers are the full list: a seen host without one can't be switched anyway.
+	if routes == nil {
+		seenMu.Lock()
+		for h := range seen {
+			hosts[h] = true
+		}
+		seenMu.Unlock()
 	}
-	seenMu.Unlock()
 	delete(hosts, allHosts)
 	list := []string{}
 	for h := range hosts {
@@ -1419,6 +1432,10 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 		`<input name="host" placeholder="app.example.com" required>` + templateSelect(tpls, "") + `<button class="maint" name="mode" value="maint">maint</button>` +
 		`<button class="block" name="mode" value="block">block</button></form></div></div></main></html>`)
 	return b.String()
+}
+
+func isIP(host string) bool {
+	return net.ParseIP(strings.Trim(host, "[]")) != nil
 }
 
 func hostOnly(hostport string) string {

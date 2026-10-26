@@ -126,6 +126,22 @@ func TestAdminPageEscapesHosts(t *testing.T) {
 	}
 }
 
+func TestIPHostsNotListed(t *testing.T) {
+	gate, admin, _ := newPair(t)
+	for _, h := range []string{"203.0.113.7", "203.0.113.7:443", "[2001:db8::1]:443", "ip.lan"} {
+		hit(gate, h)
+	}
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
+	body := rec.Body.String()
+	if strings.Contains(body, "203.0.113.7") || strings.Contains(body, "2001:db8") {
+		t.Fatal("IP address listed on the admin page")
+	}
+	if !strings.Contains(body, "ip.lan") {
+		t.Fatal("seen host missing")
+	}
+}
+
 func TestCustomMaintenancePage(t *testing.T) {
 	dir := t.TempDir()
 	page := filepath.Join(dir, "page.html")
@@ -546,6 +562,7 @@ func TestRouterCheck(t *testing.T) {
 		{"a.lan", "block", "", ""},
 		{"b.lan", "maint", "", ""},
 		{"zz.lan", "block", "", "No+Traefik+router"},
+		{"203.0.113.7", "block", "", "IP+address"},
 		{"d.lan", "block", "", "d%40docker"},
 		{"d.lan", "maint", "schedule", "d%40docker"},
 		{"d.lan", "on", "", ""},         // switching on is always allowed
@@ -557,9 +574,16 @@ func TestRouterCheck(t *testing.T) {
 			t.Errorf("%s %s %s: redirect %q, want %q", c.host, c.mode, c.action, loc, c.want)
 		}
 	}
+	seenMu.Lock()
+	seen["stray.lan"] = true // passed some gate, but no router has it as a Host
+	seenMu.Unlock()
+	defer func() { seenMu.Lock(); delete(seen, "stray.lan"); seenMu.Unlock() }()
 	rec := httptest.NewRecorder()
 	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
 	page := rec.Body.String()
+	if strings.Contains(page, "stray.lan") {
+		t.Fatal("seen host without a router listed although the API is known")
+	}
 	np := strings.Index(page, "Not protected")
 	if np < 0 || !strings.Contains(page[np:], "<li>d.lan") || !strings.Contains(page[np:], "<li>c.lan") {
 		t.Fatal("unprotected hosts not listed")
