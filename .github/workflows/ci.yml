@@ -25,6 +25,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
+          cache: false   # no dependencies to cache (and go.mod sits in the GOPATH-style checkout path)
       - name: Go tests
         working-directory: go/src/github.com/nenchi/traefik-killswitch
         run: |
