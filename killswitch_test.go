@@ -965,3 +965,59 @@ func TestGroupRowSwitchesAllNames(t *testing.T) {
 		t.Fatalf("media.example.com changed although the group was refused: %d", c)
 	}
 }
+
+func TestExcludeWildcard(t *testing.T) {
+	ex := map[string]bool{"*.home.arpa": true, "wiki.example.com": true}
+	for host, want := range map[string]bool{
+		"app.home.arpa":      true,
+		"a.b.home.arpa":      true,
+		"home.arpa":          false, // "*." needs a subdomain
+		"evilhome.arpa":      false,
+		"app.example.com":    false,
+		"wiki.example.com":   true,
+		"x.wiki.example.com": false,
+	} {
+		if got := isExcluded(ex, host); got != want {
+			t.Errorf("%s: got %v, want %v", host, got, want)
+		}
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(stateFile, []byte(`{"*":"block"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {})
+	gate, err := New(context.Background(), next, &Config{StateFile: stateFile, ExcludeHosts: []string{"*.home.arpa"}}, "gate-wild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		seenMu.Lock()
+		delete(excludedBy, "gate-wild")
+		delete(maintFiles, "gate-wild")
+		seenMu.Unlock()
+	}()
+	if c := hit(gate, "app.home.arpa"); c != 200 {
+		t.Fatalf("wildcard-excluded host blocked: %d", c)
+	}
+	if c := hit(gate, "app.example.com"); c != 403 {
+		t.Fatalf("public host not blocked: %d", c)
+	}
+	admin, err := New(context.Background(), next, &Config{StateFile: stateFile, Admin: true}, "admin-wild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := set(t, admin, "box.home.arpa", "block", nil); c != http.StatusSeeOther {
+		t.Fatalf("got %d", c)
+	}
+	b, _ := os.ReadFile(stateFile)
+	if strings.Contains(string(b), "box.home.arpa") {
+		t.Fatal("wildcard-excluded host was switched")
+	}
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/", nil))
+	page := rec.Body.String()
+	if !strings.Contains(page, "<li>*.home.arpa</li>") || strings.Contains(page, `name="host" value="app.home.arpa"`) {
+		t.Fatal("admin page: wildcard not listed as always on, or a matching host still switchable")
+	}
+}

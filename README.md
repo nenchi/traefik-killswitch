@@ -2,7 +2,7 @@
 
 ![Traefik Kill Switch](.assets/banner.png)
 
-> **Beta.** Tested against Traefik v3.7. Feedback and issues welcome.
+> Tested against Traefik v3.7. Feedback and issues welcome.
 
 A Traefik middleware plugin that does nothing until you need it. When you need it, a web page lets you
 switch any site, or all of them at once, to:
@@ -106,7 +106,7 @@ Or add it to individual routers, e.g. with the Docker label
 | `admin`           | `false`                 | Serve the web page instead of gating. Never forwards to a backend.  |
 | `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Edits apply immediately.   |
 | `apiURL`          | none                    | Admin only. Traefik's API (e.g. `http://127.0.0.1:8080`, needs `api.insecure` or another way to reach it from inside Traefik). Lets the admin page list every protected host and refuse hosts whose router doesn't use the kill switch. |
-| `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider. Listed on the admin page as "Always on". |
+| `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider. `*.home.arpa` matches every host under `home.arpa` (e.g. a VPN-only domain). Listed on the admin page as "Always on". |
 
 You can also edit the state file by hand or from a script:
 

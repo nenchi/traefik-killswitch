@@ -41,7 +41,7 @@ http:
         killswitch:
           stateFile: $STATE
           maintenanceFile: $PWD/$RUN/pages/maintenance.html
-          excludeHosts: [ks.lan]
+          excludeHosts: [ks.lan, "*.vpn.lan"]
     ks-admin:
       plugin:
         killswitch:
@@ -70,6 +70,10 @@ http:
       entryPoints: [web]
       rule: Host(\`m3.other.lan\`)
       service: msvc
+    vpn:
+      entryPoints: [web]
+      rule: Host(\`x.vpn.lan\`)
+      service: noop@internal
     admin-gated-ep:
       entryPoints: [web]
       rule: Host(\`ks.lan\`)
@@ -115,6 +119,7 @@ expect "instant again"       "$(curl -s -H 'Host: a.lan' http://127.0.0.1:18080/
 expect "b still passes"      "$(code_within b.lan 418)" 418
 expect "set *=block"         "$(set_mode '*' block)" 303
 expect "b blocked by global" "$(code_within b.lan 403)" 403
+expect "*.vpn.lan stays on"  "$(code x.vpn.lan)" 418
 expect "admin not gated"     "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/)" 200
 expect "excluded host passes" "$(code_within ks.lan 200)" 200
 expect "set *=on"            "$(set_mode '*' on)" 303

@@ -118,7 +118,7 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	host := hostOnly(req.Host)
 	// Excluded hosts (the admin page, the auth provider) are never gated, so "*" can't lock you out.
-	if k.exclude[host] {
+	if isExcluded(k.exclude, host) {
 		k.next.ServeHTTP(rw, req)
 		return
 	}
@@ -958,7 +958,7 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 		// Check every name first, so a group is switched completely or not at all.
 		warns := []string{}
 		for _, host := range hosts {
-			if excludedHosts()[host] {
+			if isExcluded(excludedHosts(), host) {
 				fail(host + " is in excludeHosts and is never switched off")
 				return
 			}
@@ -1060,6 +1060,21 @@ func sameOrigin(req *http.Request) bool {
 func contains(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// isExcluded matches host against excludeHosts entries: exact names, or "*.home.arpa" for every
+// host ending in ".home.arpa" (e.g. a VPN-only domain).
+func isExcluded(set map[string]bool, host string) bool {
+	if set[host] {
+		return true
+	}
+	for i := strings.Index(host, "."); i >= 0; i = strings.Index(host, ".") {
+		host = host[i+1:]
+		if set["*."+host] {
 			return true
 		}
 	}
@@ -1293,7 +1308,7 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	}
 	unprotected := []string{}
 	for h, r := range routes {
-		if excluded[h] {
+		if isExcluded(excluded, h) {
 			continue
 		}
 		if r.protected() {
@@ -1314,7 +1329,7 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	delete(hosts, allHosts)
 	list := []string{}
 	for h := range hosts {
-		if !excluded[h] {
+		if !isExcluded(excluded, h) {
 			list = append(list, h)
 		}
 	}
