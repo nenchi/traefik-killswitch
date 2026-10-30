@@ -218,9 +218,10 @@ letters, digits, `-` and `_`. If a picked template is later deleted, the default
 
 ## Limitations
 
-- The admin page lists hosts that are already in the state file, plus hosts seen since Traefik started.
-  You can add any other host with the form.
-- Matching is by exact host name. There are no wildcards or path rules.
+- Without `apiURL`, the admin page lists hosts that are already in the state file, plus hosts seen since
+  Traefik started. You can add any other host with the form.
+- Switching works per exact host name, or `*` for all of them. There are no wildcards or path rules;
+  only `excludeHosts` accepts `*.domain`.
 
 ## Development
 
