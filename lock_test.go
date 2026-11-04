@@ -173,6 +173,26 @@ func TestLockGate(t *testing.T) {
 	if c := send(gate, "wiki.example.com", reqOpt{remote: "203.0.113.99:1", user: "alice", pass: "s3cret-pass"}).Code; c != 200 {
 		t.Errorf("other address banned too: %d", c)
 	}
+	// the admin page lists the ban and can lift it
+	admin, _ := New(context.Background(), http.NotFoundHandler(), &Config{StateFile: state, Admin: true}, "lock-gate-admin")
+	if page := adminPage(t, admin); !strings.Contains(page, `203.0.113.7 <small>3 wrong`) || !strings.Contains(page, `value="lock-unban"`) {
+		t.Error("ban not listed on the admin page")
+	}
+	if loc := postForm(admin, url.Values{"action": {"lock-unban"}, "ip": {"203.0.113.7"}}).Header().Get("Location"); strings.Contains(loc, "err=") {
+		t.Errorf("unban: %s", loc)
+	}
+	if c := send(gate, "wiki.example.com", reqOpt{user: "alice", pass: "s3cret-pass"}).Code; c != 200 {
+		t.Errorf("after unban: %d", c)
+	}
+	if loc := postForm(admin, url.Values{"action": {"lock-unban"}, "ip": {"203.0.113.7"}}).Header().Get("Location"); !strings.Contains(loc, "err=") {
+		t.Error("unbanning an address that isn't banned should say so")
+	}
+	if hist, _ := os.ReadFile(state + ".history"); !strings.Contains(string(hist), "lock: 203.0.113.7 unbanned") {
+		t.Error("unban not in history")
+	}
+	for i := 0; i < 3; i++ {
+		send(gate, "wiki.example.com", reqOpt{user: "alice", pass: "nope"})
+	}
 	defer func() { now = time.Now }()
 	now = func() time.Time { return time.Now().Add(11 * time.Minute) }
 	if c := send(gate, "wiki.example.com", reqOpt{user: "alice", pass: "s3cret-pass"}).Code; c != 200 {

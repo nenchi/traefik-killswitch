@@ -172,6 +172,40 @@ var (
 type failCount struct {
 	n     int
 	first time.Time
+	max   int           // the gate's maxFailures when counted
+	ban   time.Duration // and its ban length
+}
+
+type banInfo struct {
+	ip    string
+	n     int
+	until time.Time
+}
+
+// bans lists the addresses that are banned right now, soonest end first.
+func bans(t time.Time) []banInfo {
+	loginMu.Lock()
+	defer loginMu.Unlock()
+	out := []banInfo{}
+	for ip, f := range failures {
+		if f.n >= f.max && t.Before(f.first.Add(f.ban)) {
+			out = append(out, banInfo{ip: ip, n: f.n, until: f.first.Add(f.ban)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].until.Before(out[j].until) })
+	return out
+}
+
+// unban forgets an address's failed logins; false if it wasn't banned.
+func unban(ip string, t time.Time) bool {
+	loginMu.Lock()
+	defer loginMu.Unlock()
+	f := failures[ip]
+	if f == nil || f.n < f.max || !t.Before(f.first.Add(f.ban)) {
+		return false
+	}
+	delete(failures, ip)
+	return true
 }
 
 // banned reports whether ip has used up its failed logins; the ban ends one window after the first failure.
@@ -201,6 +235,8 @@ func (lp *lockPolicy) fail(ip string, t time.Time) bool {
 		f = &failCount{first: t}
 		failures[ip] = f
 	}
+	f.max = lp.maxFailures
+	f.ban = lp.ban
 	f.n++
 	return f.n == lp.maxFailures
 }
@@ -276,6 +312,21 @@ func (k *KillSwitch) requireLogin(rw http.ResponseWriter, req *http.Request, hos
 func (k *KillSwitch) postLockGroup(rw http.ResponseWriter, req *http.Request, action string) {
 	fail := func(msg string) {
 		http.Redirect(rw, req, req.URL.Path+"?err="+url.QueryEscape(msg)+"#locks", http.StatusSeeOther)
+	}
+	if action == "lock-unban" {
+		ip := strings.TrimSpace(req.PostForm.Get("ip"))
+		if !unban(ip, now()) {
+			fail(ip + " is not banned (any more)")
+			return
+		}
+		user, from := actor(req)
+		who := " from " + from
+		if user != "" {
+			who = " by " + user + who
+		}
+		k.record("lock: %s unbanned%s", ip, who)
+		http.Redirect(rw, req, req.URL.Path+"#locks", http.StatusSeeOther)
+		return
 	}
 	group := strings.TrimSpace(req.PostForm.Get("group"))
 	if !validName(group, 32) {
@@ -532,7 +583,18 @@ func locksHTML(state map[string]string) string {
 	for _, g := range groups {
 		b.WriteString(`<option value="` + html.EscapeString(g) + `">`)
 	}
-	b.WriteString(`</datalist></div><div class="row"><p>Setting an existing user's password changes it. Passwords are stored only as salted hashes ` +
+	b.WriteString(`</datalist></div>`)
+	if list := bans(now()); len(list) > 0 {
+		b.WriteString(`<div class="row"><div class="host">Banned addresses<small>Too many wrong passwords. Unban lets them try again at once.</small></div><div class="chips">`)
+		for _, ban := range list {
+			b.WriteString(`<span class="chip">` + html.EscapeString(ban.ip) + ` <small>` + strconv.Itoa(ban.n) + ` wrong · until ` +
+				html.EscapeString(ban.until.In(time.Local).Format("15:04")) + `</small><form method="post"><input type="hidden" name="action" value="lock-unban">` +
+				`<input type="hidden" name="ip" value="` + html.EscapeString(ban.ip) + `"><button title="Unban ` + html.EscapeString(ban.ip) +
+				`">unban</button></form></span>`)
+		}
+		b.WriteString(`</div></div>`)
+	}
+	b.WriteString(`<div class="row"><p>Setting an existing user's password changes it. Passwords are stored only as salted hashes ` +
 		`(PBKDF2-SHA256) in the state file. After the configured number of wrong passwords an address is banned for a while (429).</p></div></div>`)
 	return b.String()
 }

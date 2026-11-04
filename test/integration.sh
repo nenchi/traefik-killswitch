@@ -223,13 +223,16 @@ expect "lock: LAN skips it"    "$(XFF=192.168.1.5 lcode)" 418
 lcode -u alice:nope >/dev/null; lcode -u alice:nope >/dev/null
 expect "lock: banned after 3 failures" "$(lcode -u alice:integration-pw)" 429
 expect "lock: other address fine" "$(XFF=203.0.113.77 lcode -u alice:integration-pw)" 418
+curl -s http://127.0.0.1:18081/ | grep -q '203.0.113.5 <small>3 wrong' && echo "ok   admin lists the ban" || { echo "FAIL ban not listed"; exit 1; }
+expect "lock: unban"           "$(post -d 'action=lock-unban&ip=203.0.113.5')" 303
+expect "lock: login works again" "$(lcode -u alice:integration-pw)" 418
 expect "lock: unlock g.lan"    "$(post -d 'action=lock&host=g.lan&lock=')" 303
 expect "lock: open again"      "$(XFF=203.0.113.78 lcode)" 418
 expect "private: set g.lan"    "$(post -d 'host=g.lan&mode=private')" 303
 expect "private: outside refused" "$(XFF=203.0.113.79 lcode)" 403
 expect "private: LAN passes"   "$(XFF=192.168.1.5 lcode)" 418
 expect "private: back on"      "$(post -d 'host=g.lan&mode=on')" 303
-for want in 'INF KILL-SWITCH: lock: user alice added to family' 'INF KILL-SWITCH: lock: g.lan locked with family' 'INF KILL-SWITCH: lock: 203.0.113.5 banned'; do
+for want in 'INF KILL-SWITCH: lock: user alice added to family' 'INF KILL-SWITCH: lock: g.lan locked with family' 'INF KILL-SWITCH: lock: 203.0.113.5 banned' 'INF KILL-SWITCH: lock: 203.0.113.5 unbanned'; do
   grep -q "$want" "$RUN/traefik.log" && echo "ok   log: $want" || { echo "FAIL log missing: $want"; grep KILL-SWITCH "$RUN/traefik.log" | tail -5; exit 1; }
 done
 for want in 'INF KILL-SWITCH: geo: ES allowed until' 'INF KILL-SWITCH: geo: DE removed'; do

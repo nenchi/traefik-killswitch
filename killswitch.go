@@ -1427,6 +1427,8 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	for h := range state {
 		if !strings.HasPrefix(h, "@") {
 			hosts[h] = true
+		} else if strings.HasPrefix(h, lockPrefix) {
+			hosts[strings.TrimPrefix(h, lockPrefix)] = true // a locked site that is "on" has no entry of its own
 		}
 	}
 	unprotected := []string{}
