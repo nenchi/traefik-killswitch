@@ -47,7 +47,7 @@ experimental:
   plugins:
     killswitch:
       moduleName: github.com/nenchi/traefik-killswitch
-      version: v0.6.1
+      version: v0.7.0
 ```
 
 Or as a local plugin, e.g. while testing a fork. Mount the repo at
