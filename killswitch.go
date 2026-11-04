@@ -47,6 +47,12 @@ type Config struct {
 	APIURL string `json:"apiURL,omitempty"`
 	// Geo (gates only) refuses visitors from countries not on the allow-list edited on the admin page.
 	Geo *GeoConfig `json:"geo,omitempty"`
+	// AllowNetworks (gates) are "inside": LAN, VPN. They pass the private mode, locks and geo.
+	AllowNetworks []string `json:"allowNetworks,omitempty"`
+	// TrustedProxies (gates) are proxies/CDNs whose X-Forwarded-For (and geo country header) is believed.
+	TrustedProxies []string `json:"trustedProxies,omitempty"`
+	// Locks (gates only) turns on the password lock: sites can be locked with a lock group on the admin page.
+	Locks *LockConfig `json:"locks,omitempty"`
 }
 
 // CreateConfig returns the default configuration.
@@ -77,6 +83,8 @@ type KillSwitch struct {
 	exclude   map[string]bool
 	apiURL    string
 	geo       *geoPolicy
+	net       *netPolicy
+	lock      *lockPolicy
 
 	routesMu  sync.Mutex
 	routes    map[string]route
@@ -103,8 +111,28 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 	}
 	k := &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile,
 		exclude: exclude, apiURL: strings.TrimRight(config.APIURL, "/")}
+	n, err := newNetPolicy(config)
+	if err != nil {
+		return nil, err
+	}
+	k.net = n
+	if !config.Admin {
+		lp, err := newLockPolicy(config.Locks)
+		if err != nil {
+			return nil, err
+		}
+		k.lock = lp
+		geoMu.Lock()
+		gateAllow[name] = len(n.allow) > 0
+		if lp != nil {
+			lockGates[name] = true
+		} else {
+			delete(lockGates, name)
+		}
+		geoMu.Unlock()
+	}
 	if config.Geo != nil && !config.Admin {
-		g, err := newGeoPolicy(config.Geo)
+		g, err := newGeoPolicy(config.Geo, n)
 		if err != nil {
 			return nil, err
 		}
@@ -129,14 +157,30 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		k.serveAdmin(rw, req)
 		return
 	}
+	host := hostOnly(req.Host)
+	excluded := isExcluded(k.exclude, host)
+	state := k.load()
+	group, when := "", ""
+	if k.lock != nil && !excluded { // excludeHosts are never locked, like they are never switched off
+		group, when = parseLock(state[lockPrefix+host])
+	}
+	ip, _ := k.net.client(req)
+	inside := k.net.inside(ip)
+	loggedIn := false
 	// The country check covers excluded hosts too: excludeHosts only means "never switched off".
 	if !k.geoPass(req) {
-		http.Error(rw, "Forbidden", http.StatusForbidden)
-		return
+		// A site locked "only outside allowed countries" asks other countries to log in instead of refusing them.
+		if group == "" || when != lockOutside {
+			http.Error(rw, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if !k.requireLogin(rw, req, host, group, state) {
+			return
+		}
+		loggedIn = true
 	}
-	host := hostOnly(req.Host)
 	// Excluded hosts (the admin page, the auth provider) are never gated, so "*" can't lock you out.
-	if isExcluded(k.exclude, host) {
+	if excluded {
 		k.next.ServeHTTP(rw, req)
 		return
 	}
@@ -162,11 +206,28 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Retry-After", strconv.Itoa(retry))
 		rw.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = rw.Write(fillBack(k.maintPage(tpl), until))
+		return
 	case modeBlock:
 		http.Error(rw, "Forbidden", http.StatusForbidden)
-	default:
-		k.next.ServeHTTP(rw, req)
+		return
+	case modePrivate:
+		if !inside {
+			http.Error(rw, "Forbidden", http.StatusForbidden)
+			return
+		}
 	}
+	// The lock applies to sites that are on (private ones only let inside visitors in, who skip the lock).
+	// "outside" on a gate with geo: the country passed the list above, so no login. Without geo it means always.
+	if group != "" && !loggedIn && !inside && !(when == lockOutside && k.geo != nil) {
+		if !k.requireLogin(rw, req, host, group, state) {
+			return
+		}
+		loggedIn = true
+	}
+	if loggedIn {
+		req.Header.Del("Authorization") // the lock's password is for the plugin, not for the app behind it
+	}
+	k.next.ServeHTTP(rw, req)
 }
 
 // maintPage reads maintenanceFile on every maintenance response, so edits apply without a restart.
@@ -967,6 +1028,10 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			k.postGeo(rw, req, a)
 			return
 		}
+		if a := req.PostForm.Get("action"); strings.HasPrefix(a, "lock-") {
+			k.postLockGroup(rw, req, a)
+			return
+		}
 		// A group row (names of one service and domain) posts one "host" field per name.
 		hosts := []string{}
 		for _, h := range req.PostForm["host"] {
@@ -980,7 +1045,11 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 		}
 		mode := req.PostForm.Get("mode")
 		action := req.PostForm.Get("action")
-		if len(hosts) == 0 || (action != "unschedule" && mode != modeOn && mode != modeMaint && mode != modeBlock) {
+		if action == "lock" && len(hosts) > 0 {
+			k.postLock(rw, req, hosts)
+			return
+		}
+		if len(hosts) == 0 || (action != "unschedule" && mode != modeOn && mode != modeMaint && mode != modeBlock && mode != modePrivate) {
 			http.Error(rw, "invalid host or mode", http.StatusBadRequest)
 			return
 		}
@@ -1029,7 +1098,7 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 				fail("enter both a start and an end date and time")
 				return
 			case mode == modeOn:
-				fail("a schedule must switch to maint or block")
+				fail("a schedule must switch to maint, block or private")
 				return
 			case !to.After(from):
 				fail("the end must be after the start")
@@ -1131,14 +1200,26 @@ func excludedHosts() map[string]bool {
 	return all
 }
 
+// privateHint warns when no gate has allowNetworks: then private lets nobody in.
+func privateHint() string {
+	geoMu.Lock()
+	defer geoMu.Unlock()
+	for _, ok := range gateAllow {
+		if ok {
+			return ""
+		}
+	}
+	return ` No gate has <code>allowNetworks</code> yet, so private works like block.`
+}
+
 // favicon is .assets/icon.svg inline, so the admin tab shows the kill switch icon without serving a file.
 const favicon = `<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%23c62828'/><path d='M32 12v20' stroke='%23fff' stroke-width='6' stroke-linecap='round'/><path d='M21 20a16 16 0 1 0 22 0' fill='none' stroke='%23fff' stroke-width='6' stroke-linecap='round'/></svg>">`
 
 const adminStyle = favicon + `<style>
 :root{color-scheme:light dark;--bg:#f5f6f8;--card:#fff;--text:#1d2330;--muted:#5d6675;--border:#e1e4e9;
---on:#1a7f37;--maint:#b35900;--block:#c62828;--btn:#eef0f3;--btn-text:#1d2330;--err:#fde7e7}
+--on:#1a7f37;--maint:#b35900;--block:#c62828;--private:#6639ba;--btn:#eef0f3;--btn-text:#1d2330;--err:#fde7e7}
 @media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--text:#e8eaee;--muted:#9aa3b0;--border:#2c323b;
---on:#3fb950;--maint:#f0a04b;--block:#ff6b6b;--btn:#2a3039;--btn-text:#e8eaee;--err:#4a1f22}}
+--on:#3fb950;--maint:#f0a04b;--block:#ff6b6b;--private:#b392f0;--btn:#2a3039;--btn-text:#e8eaee;--err:#4a1f22}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:52rem;margin:0 auto;padding:1.5rem 16px 3rem}
@@ -1150,7 +1231,7 @@ p{color:var(--muted);margin:.25rem 0 1rem}
 .host{flex:1 1 14rem;font-weight:600;overflow-wrap:anywhere}.host small{display:block;font-weight:400;color:var(--muted)}
 .pill{font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:.15rem .6rem;border-radius:999px;
 color:var(--c);background:color-mix(in srgb,var(--c) 14%,transparent)}
-.on{--c:var(--on)}.maint{--c:var(--maint)}.block{--c:var(--block)}.mixed{--c:var(--muted)}
+.on{--c:var(--on)}.maint{--c:var(--maint)}.block{--c:var(--block)}.private{--c:var(--private)}.mixed{--c:var(--muted)}
 form{display:flex;gap:.35rem;margin:0}
 button{font:inherit;padding:.3rem .8rem;border-radius:8px;border:1px solid var(--border);background:var(--btn);color:var(--btn-text);cursor:pointer}
 button:hover:not([disabled]){border-color:var(--c)}
@@ -1193,7 +1274,7 @@ func modeButtons(hosts []string, cur, curTpl string, tpls []string) string {
 		sel = strings.Replace(sel, `<select `, `<select onchange="this.form.requestSubmit(this.form.querySelector('button.maint'))" `, 1)
 	}
 	b.WriteString(sel)
-	for _, m := range []string{modeOn, modeMaint, modeBlock} {
+	for _, m := range []string{modeOn, modeMaint, modeBlock, modePrivate} {
 		active := ""
 		if m == cur {
 			active = " active"
@@ -1245,7 +1326,7 @@ func scheduleHTML(hosts []string, e entry, tpls []string) string {
 			`<form method="post">` + fields + `<button name="action" value="unschedule">Cancel</button></form></div>`)
 	}
 	b.WriteString(`<details><summary>Schedule…</summary><form method="post">` + fields +
-		`<input type="hidden" name="action" value="schedule"><select name="mode" aria-label="Scheduled mode"><option value="maint">maint</option><option value="block">block</option></select>` +
+		`<input type="hidden" name="action" value="schedule"><select name="mode" aria-label="Scheduled mode"><option value="maint">maint</option><option value="block">block</option><option value="private">private</option></select>` +
 		templateSelect(tpls, "") +
 		`<label>from <input type="datetime-local" name="from" required></label><label>to <input type="datetime-local" name="to" required></label>` +
 		`<select name="repeat" aria-label="Repeat"><option value="">once</option><option value="daily">daily</option><option value="weekly">weekly</option></select>` +
@@ -1395,7 +1476,8 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kill switch</title>` + adminStyle + `<main><div class="top"><h1>Kill switch</h1><span>` + groupToggle(grouped, routes != nil) + `<a href="?view=history">History</a></span></div>
-<p><b>on</b> serves the site, <b>maint</b> shows the maintenance page (503), <b>block</b> refuses every request (403).</p>`)
+<p><b>on</b> serves the site, <b>maint</b> shows the maintenance page (503), <b>block</b> refuses every request (403), ` +
+		`<b>private</b> lets in only <code>allowNetworks</code> (LAN, VPN).` + privateHint() + `</p>`)
 	if len(tpls) > 0 {
 		b.WriteString(`<p>Pick a page in the list, then click <b>maint</b>. While a site is in maint, picking another page switches it right away.</p>`)
 	}
@@ -1409,9 +1491,24 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	if apiErr != nil {
 		b.WriteString(`<p class="warn">Traefik API unreachable (` + html.EscapeString(apiErr.Error()) + `): can't check which hosts are protected.</p>`)
 	}
-	// Countries first: with many sites, the list below gets long.
+	// Countries and locks first: with many sites, the list below gets long.
 	if geoEnabled() {
-		b.WriteString(geoHTML(state, t) + `<h2>Sites</h2>`)
+		b.WriteString(geoHTML(state, t))
+	}
+	locks := locksEnabled()
+	groups := []string{}
+	if locks {
+		groups = lockGroups(state)
+		b.WriteString(locksHTML(state))
+	}
+	if geoEnabled() || locks {
+		b.WriteString(`<h2>Sites</h2>`)
+	}
+	lockRow := func(hosts []string) string {
+		if !locks {
+			return ""
+		}
+		return lockHTML(hosts, state, groups)
 	}
 	ge := parseEntry(state[allHosts])
 	g, gTpl, _ := ge.effective(t)
@@ -1447,7 +1544,7 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 		label := html.EscapeString(strings.Join(group, " + "))
 		if same {
 			m, tpl, _ := e.effective(t)
-			b.WriteString(`<div class="row"><div class="host">` + label + note + `</div>` + pill(m, tpl) + modeButtons(group, e.mode, e.tpl, tpls) + scheduleHTML(group, e, tpls) + `</div>`)
+			b.WriteString(`<div class="row"><div class="host">` + label + note + `</div>` + pill(m, tpl) + modeButtons(group, e.mode, e.tpl, tpls) + scheduleHTML(group, e, tpls) + lockRow(group) + `</div>`)
 			continue
 		}
 		// Names in one group differ (switched one by one): show each, one click aligns them.
@@ -1468,7 +1565,7 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 			cancel = `<div class="sched">Some names have a schedule<form method="post">` + hostFields(group) + `<button name="action" value="unschedule">Cancel all</button></form></div>`
 		}
 		b.WriteString(`<div class="row"><div class="host">` + label + `<small>` + html.EscapeString(strings.Join(detail, " · ")) + `</small>` + note + `</div>` +
-			`<span class="pill mixed">mixed</span>` + modeButtons(group, "", "", tpls) + cancel + scheduleHTML(group, entry{}, tpls) + `</div>`)
+			`<span class="pill mixed">mixed</span>` + modeButtons(group, "", "", tpls) + cancel + scheduleHTML(group, entry{}, tpls) + lockRow(group) + `</div>`)
 	}
 	if len(list) == 0 {
 		b.WriteString(`<div class="row"><p>No sites seen yet. They appear after their first request, or add one below.</p></div>`)

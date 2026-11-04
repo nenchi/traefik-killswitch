@@ -155,6 +155,7 @@ func geoGate(t *testing.T, stateFile, name string, geo *GeoConfig, exclude ...st
 	t.Cleanup(func() {
 		geoMu.Lock()
 		delete(geoDefault, name)
+		delete(gateAllow, name)
 		geoBlocked = map[string]int{}
 		geoMu.Unlock()
 	})
@@ -162,7 +163,7 @@ func geoGate(t *testing.T, stateFile, name string, geo *GeoConfig, exclude ...st
 }
 
 func visit(h http.Handler, host, remote string, header map[string]string) int {
-	h.(*KillSwitch).checked = time.Time{}
+	resetThrottle(h.(*KillSwitch)) // skip the 1s reload throttle
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil)
 	req.RemoteAddr = remote
@@ -326,7 +327,7 @@ func TestGeoAdmin(t *testing.T) {
 	}
 	// the window ends: checkGeo drops ES and logs it
 	now = func() time.Time { return base.AddDate(0, 0, 8) }
-	gate.(*KillSwitch).checked = time.Time{}
+	resetThrottle(gate.(*KillSwitch))
 	gate.(*KillSwitch).checkGeo(now())
 	b, _ := os.ReadFile(state)
 	if strings.Contains(string(b), "ES") {

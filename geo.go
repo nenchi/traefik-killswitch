@@ -35,37 +35,53 @@ const (
 
 type geoPolicy struct {
 	header       string
-	trusted      []netip.Prefix
-	allow        []netip.Prefix
+	net          *netPolicy
 	file         string
 	unknownAllow bool
 }
 
-func newGeoPolicy(c *GeoConfig) (*geoPolicy, error) {
+// netPolicy says who the visitor is and whether they are "inside": trusted proxies (whose X-Forwarded-For is
+// believed) and allowNetworks (LAN, VPN). Shared by geo, the private mode and locks.
+type netPolicy struct {
+	trusted []netip.Prefix
+	allow   []netip.Prefix
+}
+
+// newNetPolicy merges the gate's own trustedProxies/allowNetworks with the ones under geo (v0.6 configs).
+func newNetPolicy(c *Config) (*netPolicy, error) {
+	trustedList := append([]string{}, c.TrustedProxies...)
+	allowList := append([]string{}, c.AllowNetworks...)
+	if c.Geo != nil {
+		trustedList = append(trustedList, c.Geo.TrustedProxies...)
+		allowList = append(allowList, c.Geo.AllowNetworks...)
+	}
+	trusted, err := parsePrefixes(trustedList)
+	if err != nil {
+		return nil, fmt.Errorf("trustedProxies: %w", err)
+	}
+	allow, err := parsePrefixes(allowList)
+	if err != nil {
+		return nil, fmt.Errorf("allowNetworks: %w", err)
+	}
+	return &netPolicy{trusted: trusted, allow: allow}, nil
+}
+
+func newGeoPolicy(c *GeoConfig, n *netPolicy) (*geoPolicy, error) {
 	if c.CountryHeader == "" && c.GeoIPFile == "" {
 		return nil, fmt.Errorf("geo: set countryHeader, geoipFile or both")
 	}
-	if c.CountryHeader != "" && len(c.TrustedProxies) == 0 {
+	if c.CountryHeader != "" && len(n.trusted) == 0 {
 		return nil, fmt.Errorf("geo: countryHeader needs trustedProxies, or anyone could send the header")
 	}
 	if c.Unknown != "" && c.Unknown != "block" && c.Unknown != "allow" {
 		return nil, fmt.Errorf("geo: unknown must be block or allow, not %q", c.Unknown)
-	}
-	trusted, err := parsePrefixes(c.TrustedProxies)
-	if err != nil {
-		return nil, fmt.Errorf("geo trustedProxies: %w", err)
-	}
-	allow, err := parsePrefixes(c.AllowNetworks)
-	if err != nil {
-		return nil, fmt.Errorf("geo allowNetworks: %w", err)
 	}
 	for _, cc := range c.Countries {
 		if normCountry(cc) == "" {
 			return nil, fmt.Errorf("geo countries: %q is not a two-letter country code", cc)
 		}
 	}
-	return &geoPolicy{header: c.CountryHeader, trusted: trusted, allow: allow, file: c.GeoIPFile,
-		unknownAllow: c.Unknown == "allow"}, nil
+	return &geoPolicy{header: c.CountryHeader, net: n, file: c.GeoIPFile, unknownAllow: c.Unknown == "allow"}, nil
 }
 
 // parsePrefixes accepts CIDRs and single addresses; entries may also be comma-separated (Docker labels, env vars).
@@ -119,20 +135,23 @@ func parseIP(s string) netip.Addr {
 
 // client returns the visitor's address and whether the request came through a trusted proxy. Behind one,
 // the visitor is the rightmost X-Forwarded-For entry that isn't itself a trusted proxy.
-func (g *geoPolicy) client(req *http.Request) (netip.Addr, bool) {
+func (n *netPolicy) client(req *http.Request) (netip.Addr, bool) {
 	remote := parseIP(req.RemoteAddr)
-	if !remote.IsValid() || !inAny(g.trusted, remote) {
+	if !remote.IsValid() || !inAny(n.trusted, remote) {
 		return remote, false
 	}
 	xff := strings.Split(strings.Join(req.Header.Values("X-Forwarded-For"), ","), ",")
 	for i := len(xff) - 1; i >= 0; i-- {
 		a := parseIP(xff[i])
-		if a.IsValid() && !inAny(g.trusted, a) {
+		if a.IsValid() && !inAny(n.trusted, a) {
 			return a, true
 		}
 	}
 	return remote, true
 }
+
+// inside reports whether ip is in allowNetworks (LAN, VPN).
+func (n *netPolicy) inside(ip netip.Addr) bool { return ip.IsValid() && inAny(n.allow, ip) }
 
 // country finds the visitor's country: the trusted proxy's header first, then the GeoIP file. "" = unknown.
 func (g *geoPolicy) country(req *http.Request, ip netip.Addr, viaProxy bool) string {
@@ -217,6 +236,7 @@ func geoAllows(list []geoEntry, code string, t time.Time) bool {
 var (
 	geoMu       sync.Mutex
 	geoDefault  = map[string][]string{} // gate middleware name -> configured countries
+	gateAllow   = map[string]bool{}     // gate middleware name -> has allowNetworks (private mode needs them)
 	geoBlocked  = map[string]int{}      // country ("??" = unknown) -> requests refused since start
 	geoBlockMax = 300
 )
@@ -268,8 +288,8 @@ func (k *KillSwitch) geoPass(req *http.Request) bool {
 	if state[geoOffKey] != "" {
 		return true
 	}
-	ip, viaProxy := g.client(req)
-	if ip.IsValid() && inAny(g.allow, ip) {
+	ip, viaProxy := g.net.client(req)
+	if g.net.inside(ip) {
 		return true
 	}
 	code := g.country(req, ip, viaProxy)

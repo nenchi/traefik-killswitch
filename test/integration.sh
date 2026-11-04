@@ -22,6 +22,8 @@ entryPoints:
     address: "127.0.0.1:18082"
   geo:
     address: "127.0.0.1:18083"
+    forwardedHeaders:
+      trustedIPs: ["127.0.0.1"]
     http:
       middlewares: [geogate@file]
 api:
@@ -50,6 +52,10 @@ http:
       plugin:
         killswitch:
           stateFile: $STATE
+          allowNetworks: ["192.168.0.0/16"]
+          locks:
+            enabled: true
+            maxFailures: 3
           geo:
             countryHeader: X-Country
             trustedProxies: ["127.0.0.1/32"]
@@ -203,6 +209,29 @@ expect "geo: switch check off" "$(post -d 'action=geo-off')" 303
 expect "geo: off lets CN in"  "$(gcode CN)" 418
 expect "geo: switch check on"  "$(post -d 'action=geo-on')" 303
 expect "geo: on refuses CN"   "$(gcode CN)" 403
+# locks: curl plays a trusted proxy (127.0.0.1) forwarding an outside visitor over HTTPS
+lcode() { curl -s -o /dev/null -w '%{http_code}' -H 'Host: g.lan' -H 'X-Country: ES' -H "X-Forwarded-For: ${XFF:-203.0.113.5}" -H "X-Forwarded-Proto: ${PROTO:-https}" "$@" http://127.0.0.1:18083/; }
+curl -s http://127.0.0.1:18081/ | grep -q 'id="locks"' && echo "ok   admin shows Locks card" || { echo "FAIL Locks card missing"; exit 1; }
+expect "lock: create user"     "$(post -d 'action=lock-user-set&group=family&user=alice&password=integration-pw')" 303
+grep -q 'integration-pw' "$STATE" && { echo "FAIL password stored in clear"; exit 1; } || echo "ok   only the hash is stored"
+expect "lock: lock g.lan"      "$(post -d 'action=lock&host=g.lan&lock=family')" 303
+expect "lock: asks for login"  "$(lcode)" 401
+expect "lock: right password"  "$(lcode -u alice:integration-pw)" 418
+expect "lock: wrong password"  "$(lcode -u alice:nope)" 401
+expect "lock: plain HTTP refused" "$(PROTO=http lcode -u alice:integration-pw)" 403
+expect "lock: LAN skips it"    "$(XFF=192.168.1.5 lcode)" 418
+lcode -u alice:nope >/dev/null; lcode -u alice:nope >/dev/null
+expect "lock: banned after 3 failures" "$(lcode -u alice:integration-pw)" 429
+expect "lock: other address fine" "$(XFF=203.0.113.77 lcode -u alice:integration-pw)" 418
+expect "lock: unlock g.lan"    "$(post -d 'action=lock&host=g.lan&lock=')" 303
+expect "lock: open again"      "$(XFF=203.0.113.78 lcode)" 418
+expect "private: set g.lan"    "$(post -d 'host=g.lan&mode=private')" 303
+expect "private: outside refused" "$(XFF=203.0.113.79 lcode)" 403
+expect "private: LAN passes"   "$(XFF=192.168.1.5 lcode)" 418
+expect "private: back on"      "$(post -d 'host=g.lan&mode=on')" 303
+for want in 'INF KILL-SWITCH: lock: user alice added to family' 'INF KILL-SWITCH: lock: g.lan locked with family' 'INF KILL-SWITCH: lock: 203.0.113.5 banned'; do
+  grep -q "$want" "$RUN/traefik.log" && echo "ok   log: $want" || { echo "FAIL log missing: $want"; grep KILL-SWITCH "$RUN/traefik.log" | tail -5; exit 1; }
+done
 for want in 'INF KILL-SWITCH: geo: ES allowed until' 'INF KILL-SWITCH: geo: DE removed'; do
   grep -q "$want" "$RUN/traefik.log" && echo "ok   log: $want" || { echo "FAIL log missing: $want"; exit 1; }
 done

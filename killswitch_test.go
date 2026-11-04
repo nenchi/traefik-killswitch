@@ -32,8 +32,15 @@ func newPair(t *testing.T) (gate, admin http.Handler, stateFile string) {
 	return gate, admin, stateFile
 }
 
+// resetThrottle makes the next request re-read the state file (under the lock the watcher also takes).
+func resetThrottle(k *KillSwitch) {
+	k.mu.Lock()
+	k.checked = time.Time{}
+	k.mu.Unlock()
+}
+
 func hit(h http.Handler, host string) int {
-	h.(*KillSwitch).checked = time.Time{} // skip the 1s reload throttle
+	resetThrottle(h.(*KillSwitch)) // skip the 1s reload throttle
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil)
 	h.ServeHTTP(rec, req)
