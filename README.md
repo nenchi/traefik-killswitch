@@ -13,8 +13,9 @@ switch any site, or all of them at once, to:
 | `maint` | `503` + a maintenance page (yours or built-in) |
 | `block` | `403 Forbidden`, the backend is never reached  |
 
-It can also keep a **country allow-list** (geoblocking) that you edit with a few clicks, e.g. to let a
-country in for the week you travel there. See [Country allow-list](#country-allow-list-geo).
+Optionally, it can also keep a **country allow-list** (geoblocking) that you edit with a few clicks, e.g. to
+let a country in for the week you travel there. It's off unless you configure it, see
+[Country allow-list](#country-allow-list-geo).
 
 Use it when a vulnerable app has to come off the internet *now*. You click a button and it's done:
 there's no config edit, no container restart and no Traefik reload. A switch takes effect within one second.
@@ -109,7 +110,7 @@ Or add it to individual routers, e.g. with the Docker label
 | `admin`           | `false`                 | Serve the web page instead of gating. Never forwards to a backend.  |
 | `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Edits apply immediately.   |
 | `apiURL`          | none                    | Admin only. Traefik's API (e.g. `http://127.0.0.1:8080`, needs `api.insecure` or another way to reach it from inside Traefik). Lets the admin page list every protected host and refuse hosts whose router doesn't use the kill switch. |
-| `geo`             | none                    | Gates only. Country allow-list, see [below](#country-allow-list-geo). |
+| `geo`             | none (off)              | Gates only. Optional country allow-list, see [below](#country-allow-list-geo). |
 | `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider. `*.home.arpa` matches every host under `home.arpa` (e.g. a VPN-only domain). Listed on the admin page as "Always on". |
 
 You can also edit the state file by hand or from a script:
@@ -163,6 +164,9 @@ its normal mode. Nobody has to be around to switch it off or back on.
 
 ## Country allow-list (geo)
 
+**Off by default.** If you only want maintenance and block, leave `geo` out: there's no country check and no
+Countries card on the admin page, exactly as before v0.6.0.
+
 Add `geo` to a gate middleware and only visitors from the countries on a list get through; everyone else
 gets `403`. The list is edited on the admin page (**Countries**, at the top) and applies on the next request:
 
@@ -170,7 +174,7 @@ gets `403`. The list is edited on the admin page (**Countries**, at the top) and
 - **×** removes a country.
 - **Refused since Traefik started** shows which countries were turned away, with a one-click **allow**.
 - **turn off / turn on** switches the whole country check off (every country gets through) and back on;
-  the list is kept meanwhile.
+  the list is kept meanwhile. To remove the feature completely, delete the `geo` block from the config.
 
 Every change is logged and kept in the History like the other switches.
 
