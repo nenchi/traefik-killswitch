@@ -1409,6 +1409,10 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	if apiErr != nil {
 		b.WriteString(`<p class="warn">Traefik API unreachable (` + html.EscapeString(apiErr.Error()) + `): can't check which hosts are protected.</p>`)
 	}
+	// Countries first: with many sites, the list below gets long.
+	if geoEnabled() {
+		b.WriteString(geoHTML(state, t) + `<h2>Sites</h2>`)
+	}
 	ge := parseEntry(state[allHosts])
 	g, gTpl, _ := ge.effective(t)
 	b.WriteString(`<div class="card"><div class="row all"><div class="host">All sites<small>Overrides every per-site setting while not "on"`)
@@ -1470,9 +1474,6 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 		b.WriteString(`<div class="row"><p>No sites seen yet. They appear after their first request, or add one below.</p></div>`)
 	}
 	b.WriteString(`</div>`)
-	if geoEnabled() {
-		b.WriteString(geoHTML(state, t))
-	}
 	if len(unprotected) > 0 {
 		b.WriteString(`<details class="np"><summary><h2>Not protected (` + strconv.Itoa(len(unprotected)) + `)</h2></summary>` +
 			`<p>These hosts have a Traefik router without the kill switch middleware, so they can't be switched off here.</p><div class="card"><ul class="excl">`)

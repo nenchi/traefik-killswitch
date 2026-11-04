@@ -289,6 +289,9 @@ func TestGeoAdmin(t *testing.T) {
 		t.Fatal("ES should start blocked")
 	}
 	page := adminPage(t, admin)
+	if g, sites := strings.Index(page, `id="geo"`), strings.Index(page, "All sites"); g < 0 || g > sites {
+		t.Error("Countries card should come before the site list")
+	}
 	for _, want := range []string{`id="geo"`, `>AT<form`, `>DE<form`, `ES <small>1</small>`, `value="ES"><button title="Allow ES permanently"`} {
 		if !strings.Contains(page, want) {
 			t.Errorf("admin page lacks %q", want)
