@@ -204,7 +204,7 @@ http:
 | `geo` option     | Description |
 |------------------|-------------|
 | `countryHeader`  | Header with the visitor's ISO country code. Requires `trustedProxies`. |
-| `trustedProxies` | CIDRs or addresses of your CDN/proxy. Only requests from these may set the country header, and the visitor's address is the rightmost `X-Forwarded-For` entry that isn't one of them. Entries may be comma-separated. |
+| `trustedProxies` | CIDRs or addresses of your CDN/proxy. Only requests from these may set the country header, and the visitor's address is the rightmost `X-Forwarded-For` entry that isn't one of them. Entries may be comma-separated. Also list them in the entry point's `forwardedHeaders.trustedIPs`: Traefik deletes `X-Forwarded-For` from anyone else before plugins see it, so `geoipFile` and `allowNetworks` would only see the proxy's address. |
 | `geoipFile`      | A MaxMind DB (`.mmdb`) country file. Re-read within a minute when it changes, so a monthly update needs no restart. |
 | `allowNetworks`  | CIDRs that always pass, whatever the list says. Put your LAN and VPN here so you can always reach the admin page. |
 | `countries`      | The list used until the admin page saves one. After that the saved list (`@geo` in the state file) wins. |
