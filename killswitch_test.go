@@ -1028,3 +1028,34 @@ func TestExcludeWildcard(t *testing.T) {
 		t.Fatal("admin page: wildcard not listed as always on, or a matching host still switchable")
 	}
 }
+
+func TestHistoryMaxOption(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state.json")
+	next := http.NotFoundHandler()
+	if _, err := New(context.Background(), next, &Config{StateFile: state, HistoryMax: -1}, "hm-bad"); err == nil {
+		t.Error("negative historyMax accepted")
+	}
+	if historyLimit(state) != historyMax {
+		t.Fatalf("default limit %d", historyLimit(state))
+	}
+	// the gate sets nothing, the admin sets 1500: both use 1500
+	gate, _ := New(context.Background(), next, &Config{StateFile: state}, "hm-gate")
+	admin, _ := New(context.Background(), next, &Config{StateFile: state, Admin: true, HistoryMax: 1500}, "hm-admin")
+	if historyLimit(state) != 1500 {
+		t.Errorf("limit %d, want 1500", historyLimit(state))
+	}
+	for i := 0; i < 1600; i++ {
+		gate.(*KillSwitch).record("entry %d %s", i, strings.Repeat("x", 300)) // long lines, so trimming really runs
+	}
+	if n := len(readHistory(state+".history", 100000)); n < 1500 || n >= 1600 {
+		t.Errorf("kept %d entries, want 1500 to 1599 (trimmed to the configured 1500, not the default 1000)", n)
+	}
+	rec := httptest.NewRecorder()
+	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.lan/?view=history", nil))
+	if !strings.Contains(rec.Body.String(), "(last 1500 entries)") {
+		t.Error("history page doesn't show the configured limit")
+	}
+	histMu.Lock()
+	delete(historyLimits, state)
+	histMu.Unlock()
+}

@@ -12,10 +12,16 @@ switch any site, or all of them at once, to:
 | `on`    | the site, untouched (default)                  |
 | `maint` | `503` + a maintenance page (yours or built-in) |
 | `block` | `403 Forbidden`, the backend is never reached  |
+| `private` | the site from your LAN/VPN (`allowNetworks`) only, `403` for everyone else |
 
 Optionally, it can also keep a **country allow-list** (geoblocking) that you edit with a few clicks, e.g. to
-let a country in for the week you travel there. It's off unless you configure it, see
-[Country allow-list](#country-allow-list-geo).
+let a country in for the week you travel there, and put **password locks** (htaccess-style) on sites. Both are
+off unless you configure them, see [Country allow-list](#country-allow-list-geo) and [Password locks](#password-locks).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".assets/admin-dark.png">
+  <img alt="The admin page: countries, password locks and sites in every mode" src=".assets/admin-light.png" width="720">
+</picture>
 
 Use it when a vulnerable app has to come off the internet *now*. You click a button and it's done:
 there's no config edit, no container restart and no Traefik reload. A switch takes effect within one second.
@@ -111,6 +117,10 @@ Or add it to individual routers, e.g. with the Docker label
 | `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Edits apply immediately.   |
 | `apiURL`          | none                    | Admin only. Traefik's API (e.g. `http://127.0.0.1:8080`, needs `api.insecure` or another way to reach it from inside Traefik). Lets the admin page list every protected host and refuse hosts whose router doesn't use the kill switch. |
 | `geo`             | none (off)              | Gates only. Optional country allow-list, see [below](#country-allow-list-geo). |
+| `locks`           | none (off)              | Gates only. Optional password locks: `enabled: true`, see [below](#password-locks). |
+| `allowNetworks`   | none                    | Gates only. Your LAN/VPN (CIDRs). They pass `private`, skip locks and the country check. |
+| `trustedProxies`  | none                    | Gates only. Your CDN/proxy (CIDRs): its `X-Forwarded-For`, `X-Forwarded-Proto` and country header are believed. |
+| `historyMax`      | `1000`                  | Entries kept in `<stateFile>.history`. Set it on any middleware with that state file; the largest value applies to all of them. |
 | `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider. `*.home.arpa` matches every host under `home.arpa` (e.g. a VPN-only domain). Listed on the admin page as "Always on". |
 
 You can also edit the state file by hand or from a script:
@@ -119,7 +129,8 @@ You can also edit the state file by hand or from a script:
 { "*": "on", "app.example.com": "maint", "api.example.com": "maint:downtime", "old.example.com": "block" }
 ```
 
-`maint:downtime` means maintenance mode with the `downtime` template (see below). A value can also carry
+`maint:downtime` means maintenance mode with the `downtime` template (see below). Keys starting with `@` are
+not sites: `@geo` / `@geo-off` hold the country list, `@lockgroup:<group>` and `@lock:<host>` the locks. A value can also carry
 a scheduled window: `"on|block|2026-10-26T22:00:00+01:00|2026-10-27T02:00:00+01:00"` (optionally followed by
 `|<created>|<user>|daily` or `|weekly`) means "normally on,
 blocked during that window".
@@ -179,6 +190,8 @@ gets `403`. The list is edited on the admin page (**Countries**, at the top) and
   the list is kept meanwhile. To remove the feature completely, delete the `geo` block from the config.
 
 Every change is logged and kept in the History like the other switches.
+
+![The Countries card](.assets/countries.png)
 
 The plugin needs to know each visitor's country. It can read it from a header that a CDN or proxy in
 front of Traefik adds, look it up in a GeoIP file, or both (header first, file as fallback):
@@ -270,6 +283,74 @@ Good to know:
   `"@geo": "DE,AT,ES@2026-11-11T18:00:00+01:00"` (a country with `@time` is allowed until then). While the check is
   switched off, the state file has an `"@geo-off"` entry; deleting it switches it back on.
 
+## Password locks
+
+**Off by default.** Add `locks` to a gate and sites behind it can be locked with a user name and password,
+like an `.htaccess` lock, from the admin page:
+
+```yaml
+killswitch:
+  plugin:
+    killswitch:
+      stateFile: /data/killswitch.json
+      allowNetworks: [192.168.0.0/16, 10.0.0.0/8]   # LAN, VPN: never asked
+      locks:
+        enabled: true
+        # maxFailures: 5    # wrong passwords per address before a ban
+        # banMinutes: 10    # ban length
+```
+
+With Docker labels: `traefik.http.middlewares.killswitch.plugin.killswitch.locks.enabled=true`.
+
+![The Locks card](.assets/locks.png)
+
+- **Lock groups:** create a group (e.g. `family`) by adding a user and password in the **Locks** card; add more
+  users the same way, and setting an existing user's password changes it.
+- **Lock a site:** open **Lock…** in its row and pick a group. Several sites can share one group; a grouped row
+  (e.g. `wiki.example.com + w.example.com`) is locked as a whole.
+- **When** (only on gates with `geo`):
+  - **always:** every visitor must log in. On a geo gate, other countries still get `403` before any login
+    prompt, so they can't even try passwords.
+  - **only outside allowed countries:** visitors from the Countries list go straight in, everyone else gets
+    the login prompt instead of `403`. Handy when you travel without a VPN; it does show the prompt to the world.
+
+| Gate        | Lock                      | Allowed country | Other country |
+|-------------|---------------------------|-----------------|---------------|
+| without geo | always                    | password        | password      |
+| geo         | none                      | in              | `403`         |
+| geo         | always                    | password        | `403`         |
+| geo         | only outside allowed      | in              | password      |
+
+`allowNetworks` pass in every row. `maint`, `block` and `private` win over a lock, and `excludeHosts` are never locked.
+
+**Passwords** are stored only as salted PBKDF2-SHA256 hashes in the state file (`@lockgroup:<group>`); user names
+are stored as they are, like in an `htpasswd` file. The history records who added or removed a user, never a
+password. Keep the state file private anyway: it should never be served by a site.
+
+**Logins need HTTPS.** Over plain HTTP the password would travel unencrypted, so a locked site answers `403`
+instead of asking. TLS at Traefik counts, and so does a `trustedProxies` proxy that sends `X-Forwarded-Proto: https`.
+After a successful login the `Authorization` header is removed, so the password never reaches the app behind it.
+
+### Brute force
+
+- **Built in:** after `maxFailures` wrong passwords (default 5), the address gets `429` for `banMinutes`
+  (default 10), on every locked site behind that gate. The admin page lists banned addresses with an **unban**
+  button.
+- **The ban lives in memory**, so a Traefik restart lifts it. For longer or server-wide bans, add
+  **fail2ban or CrowdSec**: every wrong password is a `401` in Traefik's access log, and the ban itself is logged
+  as `INF KILL-SWITCH: lock: <ip> banned for 10m0s after 5 failed logins (<host>)`. Note that the 401 brute-force
+  scenario in CrowdSec's hub (`LePresidente/http-generic-401-bf`) only counts `POST` requests, while browsers send
+  these logins as `GET`, so CrowdSec needs a custom scenario for this (or use fail2ban on the access log).
+- Use **strong passwords**. A lock is a good extra gate in front of an app, not a replacement for the app's own
+  login on something important. For single sign-on, a forwardAuth provider (Authentik, Authelia) is the better tool.
+
+## Private mode
+
+`private` is a fourth mode next to on/maint/block: only `allowNetworks` (LAN, VPN) get the site, everyone
+else gets `403`. One click closes a site to the internet while you keep using it over the VPN, with no
+passwords involved. It works per site, for **All sites**, and in schedules. Without `allowNetworks` on a gate,
+`private` lets nobody in (the admin page says so).
+
 ## Logging
 
 Every change is written to Traefik's log as an INFO line, with the user (from basic auth or Authentik's
@@ -284,7 +365,7 @@ Every change is written to Traefik's log as an INFO line, with the user (from ba
 
 A window that's already running when Traefik starts is logged as `schedule active since …`.
 
-The same entries are kept in `<stateFile>.history` (the newest 1000) and shown on the admin page under
+The same entries are kept in `<stateFile>.history` (the newest 1000, see `historyMax`) and shown on the admin page under
 **History**, so they survive restarts and Docker log rotation.
 Filter with `docker logs traefik 2>&1 | grep KILL-SWITCH`. Errors are logged at ERR level as before.
 
@@ -328,7 +409,9 @@ letters, digits, `-` and `_`. If a picked template is later deleted, the default
   `excludeHosts`. Otherwise setting `*` to `block` locks you out of the switch, and you'd have to
   edit the file by hand.
 - Cross-site form posts are rejected (`Origin` / `Sec-Fetch-Site` checks).
-- With `geo`, keep `trustedProxies` exact: any address in it can claim any country.
+- With `geo`, keep `trustedProxies` exact: any address in it can claim any country, and (with locks) say that
+  the visitor uses HTTPS.
+- With `locks`, see [Brute force](#brute-force).
 
 ## Limitations
 

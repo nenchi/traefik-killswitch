@@ -53,6 +53,9 @@ type Config struct {
 	TrustedProxies []string `json:"trustedProxies,omitempty"`
 	// Locks (gates only) turns on the password lock: sites can be locked with a lock group on the admin page.
 	Locks *LockConfig `json:"locks,omitempty"`
+	// HistoryMax is how many entries <stateFile>.history keeps (default 1000). The largest value set on any
+	// middleware with the same stateFile applies to all of them.
+	HistoryMax int `json:"historyMax,omitempty"`
 }
 
 // CreateConfig returns the default configuration.
@@ -114,6 +117,16 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 	n, err := newNetPolicy(config)
 	if err != nil {
 		return nil, err
+	}
+	if config.HistoryMax < 0 || config.HistoryMax > 1000000 {
+		return nil, fmt.Errorf("historyMax must be between 1 and 1000000")
+	}
+	if config.HistoryMax > 0 {
+		histMu.Lock()
+		if config.HistoryMax > historyLimits[config.StateFile] {
+			historyLimits[config.StateFile] = config.HistoryMax
+		}
+		histMu.Unlock()
 	}
 	k.net = n
 	if !config.Admin {
@@ -301,7 +314,20 @@ var (
 // histMu serializes appends to the history files.
 var histMu sync.Mutex
 
-const historyMax = 1000 // entries kept in <stateFile>.history
+const historyMax = 1000 // default number of entries kept in <stateFile>.history
+
+// historyLimits holds the historyMax per state file: the largest any middleware on that file configured, so
+// the admin page and the gates (which log schedule starts and ends) trim the shared file the same way.
+var historyLimits = map[string]int{} // guarded by histMu
+
+func historyLimit(stateFile string) int {
+	histMu.Lock()
+	defer histMu.Unlock()
+	if n := historyLimits[stateFile]; n > 0 {
+		return n
+	}
+	return historyMax
+}
 
 // record logs an action and appends it to the history file shown on the admin page.
 func (k *KillSwitch) record(format string, args ...interface{}) {
@@ -321,9 +347,13 @@ func (k *KillSwitch) record(format string, args ...interface{}) {
 		log.Printf("killswitch %s: history: %v", k.name, err)
 		return
 	}
-	// Trim to the newest historyMax entries once the file is clearly over (~120 bytes per entry).
-	if fi, err := os.Stat(path); err == nil && fi.Size() > historyMax*240 {
-		lines := readHistory(path, historyMax)
+	// Trim to the newest entries once the file is clearly over the limit (~120 bytes per entry).
+	limit := historyLimits[k.stateFile] // histMu is held
+	if limit <= 0 {
+		limit = historyMax
+	}
+	if fi, err := os.Stat(path); err == nil && fi.Size() > int64(limit)*240 {
+		lines := readHistory(path, limit)
 		var b strings.Builder
 		for i := len(lines) - 1; i >= 0; i-- {
 			b.WriteString(lines[i] + "\n")
@@ -1338,8 +1368,8 @@ func (k *KillSwitch) renderHistory() string {
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kill switch history</title>` + adminStyle + `<main><div class="top"><h1>History</h1><a href="?">← Kill switch</a></div>
-<p>Newest first. Kept in <code>` + html.EscapeString(filepath.Base(k.stateFile)) + `.history</code> (last ` + strconv.Itoa(historyMax) + ` entries).</p><div class="card"><ol class="hist">`)
-	lines := readHistory(k.stateFile+".history", historyMax)
+<p>Newest first. Kept in <code>` + html.EscapeString(filepath.Base(k.stateFile)) + `.history</code> (last ` + strconv.Itoa(historyLimit(k.stateFile)) + ` entries).</p><div class="card"><ol class="hist">`)
+	lines := readHistory(k.stateFile+".history", historyLimit(k.stateFile))
 	for _, l := range lines {
 		ts, msg := l, ""
 		if i := strings.Index(l, " "); i > 0 {
