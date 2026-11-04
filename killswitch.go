@@ -45,6 +45,8 @@ type Config struct {
 	// APIURL (admin only) is Traefik's API, e.g. http://127.0.0.1:8080. With it the admin page knows
 	// which hosts have a router and whether that router uses the kill switch.
 	APIURL string `json:"apiURL,omitempty"`
+	// Geo (gates only) refuses visitors from countries not on the allow-list edited on the admin page.
+	Geo *GeoConfig `json:"geo,omitempty"`
 }
 
 // CreateConfig returns the default configuration.
@@ -74,6 +76,7 @@ type KillSwitch struct {
 	maintFile string
 	exclude   map[string]bool
 	apiURL    string
+	geo       *geoPolicy
 
 	routesMu  sync.Mutex
 	routes    map[string]route
@@ -100,6 +103,16 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 	}
 	k := &KillSwitch{next: next, name: name, stateFile: config.StateFile, admin: config.Admin, maintFile: config.MaintenanceFile,
 		exclude: exclude, apiURL: strings.TrimRight(config.APIURL, "/")}
+	if config.Geo != nil && !config.Admin {
+		g, err := newGeoPolicy(config.Geo)
+		if err != nil {
+			return nil, err
+		}
+		k.geo = g
+		geoMu.Lock()
+		geoDefault[name] = config.Geo.Countries
+		geoMu.Unlock()
+	}
 	seenMu.Lock()
 	if !config.Admin {
 		excludedBy[name] = list
@@ -114,6 +127,11 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if k.admin {
 		k.serveAdmin(rw, req)
+		return
+	}
+	// The country check covers excluded hosts too: excludeHosts only means "never switched off".
+	if !k.geoPass(req) {
+		http.Error(rw, "Forbidden", http.StatusForbidden)
 		return
 	}
 	host := hostOnly(req.Host)
@@ -282,6 +300,7 @@ func watch() {
 		seenMu.Unlock()
 		for _, k := range list {
 			k.checkWindows(time.Now())
+			k.checkGeo(time.Now())
 		}
 	}
 }
@@ -305,6 +324,9 @@ func (k *KillSwitch) checkWindows(t time.Time) {
 		endedNow[host] = true
 	}
 	for host, v := range state {
+		if strings.HasPrefix(host, "@") {
+			continue // @geo and future non-host keys
+		}
 		e := parseEntry(v)
 		if !e.scheduled() {
 			continue
@@ -650,6 +672,22 @@ var writeMu sync.Mutex
 
 // update applies fn to host's entry and saves the state file, dropping windows that have ended.
 func (k *KillSwitch) update(host string, fn func(e *entry)) error {
+	return k.writeState(func(state map[string]string) {
+		e := parseEntry(state[host])
+		fn(&e)
+		if e.ended(now()) {
+			e.to = time.Time{}
+		}
+		if v := e.String(); v == modeOn && host != allHosts {
+			delete(state, host)
+		} else {
+			state[host] = v
+		}
+	})
+}
+
+// writeState applies fn to the current state and saves it atomically; every instance reloads on its next request.
+func (k *KillSwitch) writeState(fn func(state map[string]string)) error {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	state, err := readState(k.stateFile)
@@ -659,16 +697,7 @@ func (k *KillSwitch) update(host string, fn func(e *entry)) error {
 	} else if err != nil {
 		return err
 	}
-	e := parseEntry(state[host])
-	fn(&e)
-	if e.ended(now()) {
-		e.to = time.Time{}
-	}
-	if v := e.String(); v == modeOn && host != allHosts {
-		delete(state, host)
-	} else {
-		state[host] = v
-	}
+	fn(state)
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -934,9 +963,17 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if a := req.PostForm.Get("action"); a == "geo-allow" || a == "geo-remove" {
+			k.postGeo(rw, req, a)
+			return
+		}
 		// A group row (names of one service and domain) posts one "host" field per name.
 		hosts := []string{}
 		for _, h := range req.PostForm["host"] {
+			if strings.HasPrefix(strings.TrimSpace(h), "@") {
+				http.Error(rw, "invalid host", http.StatusBadRequest)
+				return
+			}
 			if h = strings.ToLower(strings.TrimSpace(h)); h != "" && !contains(hosts, h) {
 				hosts = append(hosts, h)
 			}
@@ -1132,6 +1169,9 @@ ul.excl{margin:0;padding:.6rem 1rem .6rem 2rem;color:var(--muted)}
 .sched b{color:var(--text)}details{flex-basis:100%}summary{cursor:pointer;color:var(--muted);font-size:.9rem}
 details form{flex-wrap:wrap;align-items:center;margin-top:.5rem}details label{display:flex;gap:.35rem;align-items:center}
 details input{flex:0 1 auto}
+.chips{display:flex;flex-wrap:wrap;gap:.4rem}.chip{display:inline-flex;align-items:center;gap:.35rem;padding:.15rem .2rem .15rem .65rem;
+border:1px solid var(--border);border-radius:999px;font-weight:600}.chip small{font-weight:400;color:var(--muted)}
+.chip button{padding:0 .5rem;border-radius:999px;line-height:1.6}
 </style>`
 
 // hostFields renders one hidden "host" input per name, so a form switches a whole group.
@@ -1304,7 +1344,9 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 	routes, apiErr := k.hostRoutes()
 	hosts := map[string]bool{}
 	for h := range state {
-		hosts[h] = true
+		if !strings.HasPrefix(h, "@") {
+			hosts[h] = true
+		}
 	}
 	unprotected := []string{}
 	for h, r := range routes {
@@ -1428,6 +1470,9 @@ func (k *KillSwitch) renderAdmin(errMsg, warnMsg string, grouped bool) string {
 		b.WriteString(`<div class="row"><p>No sites seen yet. They appear after their first request, or add one below.</p></div>`)
 	}
 	b.WriteString(`</div>`)
+	if geoEnabled() {
+		b.WriteString(geoHTML(state, t))
+	}
 	if len(unprotected) > 0 {
 		b.WriteString(`<details class="np"><summary><h2>Not protected (` + strconv.Itoa(len(unprotected)) + `)</h2></summary>` +
 			`<p>These hosts have a Traefik router without the kill switch middleware, so they can't be switched off here.</p><div class="card"><ul class="excl">`)

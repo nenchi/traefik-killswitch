@@ -2,7 +2,7 @@
 
 ![Traefik Kill Switch](.assets/banner.png)
 
-> Tested against Traefik v3.7. Feedback and issues welcome.
+> For Traefik v3 (tested against v3.7). Feedback and issues welcome.
 
 A Traefik middleware plugin that does nothing until you need it. When you need it, a web page lets you
 switch any site, or all of them at once, to:
@@ -12,6 +12,9 @@ switch any site, or all of them at once, to:
 | `on`    | the site, untouched (default)                  |
 | `maint` | `503` + a maintenance page (yours or built-in) |
 | `block` | `403 Forbidden`, the backend is never reached  |
+
+It can also keep a **country allow-list** (geoblocking) that you edit with a few clicks, e.g. to let a
+country in for the week you travel there. See [Country allow-list](#country-allow-list-geo).
 
 Use it when a vulnerable app has to come off the internet *now*. You click a button and it's done:
 there's no config edit, no container restart and no Traefik reload. A switch takes effect within one second.
@@ -106,6 +109,7 @@ Or add it to individual routers, e.g. with the Docker label
 | `admin`           | `false`                 | Serve the web page instead of gating. Never forwards to a backend.  |
 | `maintenanceFile` | built-in page           | HTML served with `503` in `maint` mode. Edits apply immediately.   |
 | `apiURL`          | none                    | Admin only. Traefik's API (e.g. `http://127.0.0.1:8080`, needs `api.insecure` or another way to reach it from inside Traefik). Lets the admin page list every protected host and refuse hosts whose router doesn't use the kill switch. |
+| `geo`             | none                    | Gates only. Country allow-list, see [below](#country-allow-list-geo). |
 | `excludeHosts`    | none                    | Hosts that are never gated: the admin page and your auth provider. `*.home.arpa` matches every host under `home.arpa` (e.g. a VPN-only domain). Listed on the admin page as "Always on". |
 
 You can also edit the state file by hand or from a script:
@@ -156,6 +160,73 @@ its normal mode. Nobody has to be around to switch it off or back on.
 - Times are entered and shown in server time (the Traefik container's time zone, e.g. `TZ=Europe/Berlin`).
   The admin page shows the zone and the current server time.
 - During a `maint` window, `Retry-After` tells clients when the window ends.
+
+## Country allow-list (geo)
+
+Add `geo` to a gate middleware and only visitors from the countries on a list get through; everyone else
+gets `403`. The list is edited on the admin page (**Countries**) and applies on the next request:
+
+- **Allow** a country permanently, or for 1, 7, 14 or 30 days (it is removed again when the time is up).
+- **×** removes a country.
+- **Refused since Traefik started** shows which countries were turned away, with a one-click **allow**.
+
+Every change is logged and kept in the History like the other switches.
+
+The plugin needs to know each visitor's country. It can read it from a header that a CDN or proxy in
+front of Traefik adds, look it up in a GeoIP file, or both (header first, file as fallback):
+
+| Setup in front of Traefik                       | Config                                                       |
+|-------------------------------------------------|--------------------------------------------------------------|
+| Cloudflare (proxied DNS or Tunnel)              | `countryHeader: CF-IPCountry` + `trustedProxies`: Cloudflare's ranges |
+| AWS CloudFront                                  | `countryHeader: CloudFront-Viewer-Country` + `trustedProxies` |
+| nginx / HAProxy / another proxy with GeoIP      | `countryHeader: X-Country-Code` (whatever it sets) + `trustedProxies` |
+| Nothing: Traefik is directly on the internet    | `geoipFile: /data/country.mmdb`                              |
+
+```yaml
+http:
+  middlewares:
+    killswitch:
+      plugin:
+        killswitch:
+          stateFile: /data/killswitch.json
+          geo:
+            countryHeader: CF-IPCountry
+            trustedProxies:            # the header is only believed from these addresses
+              - 173.245.48.0/20        # ... all of https://www.cloudflare.com/ips/
+            # geoipFile: /data/country.mmdb
+            allowNetworks:             # always pass: LAN, VPN
+              - 192.168.0.0/16
+              - 10.0.0.0/8
+            countries: [DE, AT, CH]    # starting list, until the first change on the admin page
+            # unknown: block           # no country found: block (default) or allow
+```
+
+| `geo` option     | Description |
+|------------------|-------------|
+| `countryHeader`  | Header with the visitor's ISO country code. Requires `trustedProxies`. |
+| `trustedProxies` | CIDRs or addresses of your CDN/proxy. Only requests from these may set the country header, and the visitor's address is the rightmost `X-Forwarded-For` entry that isn't one of them. Entries may be comma-separated. |
+| `geoipFile`      | A MaxMind DB (`.mmdb`) country file. Re-read within a minute when it changes, so a monthly update needs no restart. |
+| `allowNetworks`  | CIDRs that always pass, whatever the list says. Put your LAN and VPN here so you can always reach the admin page. |
+| `countries`      | The list used until the admin page saves one. After that the saved list (`@geo` in the state file) wins. |
+| `unknown`        | `block` (default) or `allow` when no country can be found: a request that didn't come through a trusted proxy and isn't in the GeoIP file, or a missing file. |
+
+**GeoIP files.** Free country files in this format: [DB-IP Lite Country](https://db-ip.com/db/download/ip-to-country-lite)
+(CC BY 4.0, no account, monthly) or [MaxMind GeoLite2-Country](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data)
+(free account). City files work too. The plugin reads the file itself (no extra dependency); keep it
+up to date with a cron job or MaxMind's `geoipupdate`.
+
+Good to know:
+
+- **Close the side door.** With `countryHeader`, a request that reaches Traefik directly (not through the
+  CDN) has no trusted country, so it's `unknown` and blocked by default. That's on purpose: otherwise anyone
+  who knows your server's IP could skip the CDN and the country check. Ports other than the gated entry
+  points (SSH, WireGuard, ...) are not affected.
+- **`excludeHosts` are checked too.** They are only exempt from on/maint/block, not from the country list, so
+  your SSO and password manager stay geoblocked. Reach them through `allowNetworks` when you're away.
+- The list is the same for every site behind gates with `geo`. Codes are ISO 3166-1 alpha-2; Cloudflare
+  also sends `XX` (unknown) and `T1` (Tor), which you can allow like any other code.
+- Locked yourself out? Connect through an `allowNetworks` address (VPN), or edit `@geo` in the state file:
+  `"@geo": "DE,AT,ES@2026-11-11T18:00:00+01:00"` (a country with `@time` is allowed until then).
 
 ## Logging
 
@@ -215,6 +286,7 @@ letters, digits, `-` and `_`. If a picked template is later deleted, the default
   `excludeHosts`. Otherwise setting `*` to `block` locks you out of the switch, and you'd have to
   edit the file by hand.
 - Cross-site form posts are rejected (`Origin` / `Sec-Fetch-Site` checks).
+- With `geo`, keep `trustedProxies` exact: any address in it can claim any country.
 
 ## Limitations
 

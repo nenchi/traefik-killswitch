@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 TRAEFIK=${TRAEFIK:-traefik}
 RUN=test/run
 rm -rf "$RUN" && mkdir -p "$RUN/plugins-local/src/github.com/nenchi/traefik-killswitch"
-cp go.mod .traefik.yml killswitch.go "$RUN/plugins-local/src/github.com/nenchi/traefik-killswitch/"
+cp go.mod .traefik.yml $(ls *.go | grep -v _test.go) "$RUN/plugins-local/src/github.com/nenchi/traefik-killswitch/"
 STATE="$PWD/$RUN/state.json"
 mkdir -p "$RUN/pages" && echo "default-page" > "$RUN/pages/maintenance.html" && echo "downtime-page" > "$RUN/pages/downtime.html" && echo "back: {{back|soon}}" > "$RUN/pages/back.html"
 
@@ -20,6 +20,10 @@ entryPoints:
     address: "127.0.0.1:18081"
   traefik:
     address: "127.0.0.1:18082"
+  geo:
+    address: "127.0.0.1:18083"
+    http:
+      middlewares: [geogate@file]
 api:
   insecure: true
 providers:
@@ -42,6 +46,14 @@ http:
           stateFile: $STATE
           maintenanceFile: $PWD/$RUN/pages/maintenance.html
           excludeHosts: [ks.lan, "*.vpn.lan"]
+    geogate:
+      plugin:
+        killswitch:
+          stateFile: $STATE
+          geo:
+            countryHeader: X-Country
+            trustedProxies: ["127.0.0.1/32"]
+            countries: [DE]
     ks-admin:
       plugin:
         killswitch:
@@ -73,6 +85,10 @@ http:
     vpn:
       entryPoints: [web]
       rule: Host(\`x.vpn.lan\`)
+      service: noop@internal
+    geo-site:
+      entryPoints: [geo]
+      rule: Host(\`g.lan\`)
       service: noop@internal
     admin-gated-ep:
       entryPoints: [web]
@@ -173,6 +189,19 @@ echo "$PAGE" | grep -q '<li>c.lan <small>(unprotected@file)' && echo "ok   admin
 echo "$PAGE" | grep -q '(upcoming)' && echo "ok   admin shows upcoming window" || { echo "FAIL upcoming window not shown"; exit 1; }
 echo "$PAGE" | grep -q 'value="b.lan"' && echo "ok   admin lists seen host b.lan" || { echo "FAIL admin does not list seen host"; exit 1; }
 echo "$PAGE" | grep -q '<li>ks.lan</li>' && echo "ok   admin lists excluded host ks.lan as always on" || { echo "FAIL excluded host not shown"; exit 1; }
+gcode() { curl -s -o /dev/null -w '%{http_code}' -H 'Host: g.lan' ${1:+-H "X-Country: $1"} http://127.0.0.1:18083/; }
+expect "geo: allowed country" "$(gcode DE)" 418
+expect "geo: other country"   "$(gcode ES)" 403
+expect "geo: no country"      "$(gcode)" 403
+curl -s http://127.0.0.1:18081/ | grep -q 'ES <small>1</small>' && echo "ok   admin shows refused ES" || { echo "FAIL refused ES not shown"; exit 1; }
+expect "geo: allow ES 7 days" "$(post -d 'action=geo-allow&country=ES&days=7')" 303
+expect "geo: ES on next request" "$(gcode ES)" 418
+expect "geo: remove DE"       "$(post -d 'action=geo-remove&country=DE')" 303
+expect "geo: DE now refused"  "$(gcode DE)" 403
+expect "geo: web gate has no geo" "$(code a.lan)" 418
+for want in 'INF KILL-SWITCH: geo: ES allowed until' 'INF KILL-SWITCH: geo: DE removed'; do
+  grep -q "$want" "$RUN/traefik.log" && echo "ok   log: $want" || { echo "FAIL log missing: $want"; exit 1; }
+done
 for want in 'INF KILL-SWITCH: a.lan set to maint from 127.0.0.1' 'INF KILL-SWITCH: all sites set to block' \
   'INF KILL-SWITCH: schedule created for b.lan: block' 'INF KILL-SWITCH: schedule active since' 'INF KILL-SWITCH: schedule cancelled for b.lan'; do
   grep -q "$want" "$RUN/traefik.log" && echo "ok   log: $want" || { echo "FAIL log missing: $want"; grep KILL-SWITCH "$RUN/traefik.log"; exit 1; }
