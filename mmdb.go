@@ -220,8 +220,18 @@ func (d decoder) ctrl(off int) (int, int, int, error) {
 	return typ, size, off, nil
 }
 
+// maxDepth bounds nesting and pointer chains, so a crafted file can't recurse forever.
+const maxDepth = 32
+
+var errDepth = errors.New("mmdb: data nested too deeply")
+
 // skip returns the offset after the field at off (a pointer is skipped, not followed).
-func (d decoder) skip(off int) (int, error) {
+func (d decoder) skip(off int) (int, error) { return d.skipN(off, 0) }
+
+func (d decoder) skipN(off, depth int) (int, error) {
+	if depth > maxDepth {
+		return 0, errDepth
+	}
 	typ, size, next, err := d.ctrl(off)
 	if err != nil {
 		return 0, err
@@ -235,7 +245,7 @@ func (d decoder) skip(off int) (int, error) {
 			n = size * 2
 		}
 		for j := 0; j < n; j++ {
-			next, err = d.skip(next)
+			next, err = d.skipN(next, depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -255,8 +265,14 @@ func (d decoder) str(off int) (string, int, error) {
 		return "", 0, err
 	}
 	if typ == typePointer {
-		s, _, err := d.str(size)
-		return s, next, err
+		t2, size2, next2, err := d.ctrl(size)
+		if err != nil {
+			return "", 0, err
+		}
+		if t2 != typeString || next2+size2 > len(d.buf) {
+			return "", 0, fmt.Errorf("mmdb: pointer to type %d, want string", t2)
+		}
+		return string(d.buf[next2 : next2+size2]), next, nil
 	}
 	if typ != typeString {
 		return "", 0, fmt.Errorf("mmdb: want string, got type %d", typ)
@@ -273,6 +289,10 @@ func (d decoder) uint(off int) (uint64, int, error) {
 		return 0, 0, err
 	}
 	if typ == typePointer {
+		t2, _, _, err := d.ctrl(size)
+		if err != nil || t2 == typePointer {
+			return 0, 0, fmt.Errorf("mmdb: bad pointer in metadata")
+		}
 		v, _, err := d.uint(size)
 		return v, next, err
 	}
@@ -287,13 +307,18 @@ func (d decoder) uint(off int) (uint64, int, error) {
 }
 
 // find walks map keys from off and returns the offset of the value at path.
-func (d decoder) find(off int, path []string) (int, bool) {
+func (d decoder) find(off int, path []string) (int, bool) { return d.findN(off, path, 0) }
+
+func (d decoder) findN(off int, path []string, depth int) (int, bool) {
+	if depth > maxDepth {
+		return 0, false
+	}
 	typ, size, next, err := d.ctrl(off)
 	if err != nil {
 		return 0, false
 	}
 	if typ == typePointer {
-		return d.find(size, path)
+		return d.findN(size, path, depth+1)
 	}
 	if len(path) == 0 {
 		return off, true
@@ -307,7 +332,7 @@ func (d decoder) find(off int, path []string) (int, bool) {
 			return 0, false
 		}
 		if key == path[0] {
-			return d.find(valOff, path[1:])
+			return d.findN(valOff, path[1:], depth+1)
 		}
 		next, err = d.skip(valOff)
 		if err != nil {

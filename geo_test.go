@@ -368,3 +368,65 @@ func adminPage(t *testing.T, admin http.Handler) string {
 	admin.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://ks.example.com/", nil))
 	return rec.Body.String()
 }
+
+// MaxMind's official test files: written by their real writer (pointers, shared data), see testdata/README.md.
+func TestMaxMindTestFile(t *testing.T) {
+	buf, err := os.ReadFile("testdata/GeoLite2-Country-Test.mmdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := parseMMDB(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ip, want := range map[string]string{
+		"2.125.160.216": "GB", "81.2.69.160": "GB", "89.160.20.112": "SE", "89.160.20.200": "SE", "216.160.83.56": "US",
+		"67.43.156.1": "BT", "111.235.160.1": "CN", "202.196.224.1": "PH", "217.65.48.1": "GI",
+		"2001:218::1": "JP", "2001:220::1": "KR", "2001:238::1": "TW", "2001:2e0::1": "HK",
+		"::ffff:81.2.69.160": "GB", "8.8.8.8": "", "10.0.0.1": "", "2001:db8::1": "",
+	} {
+		if got := db.country(netip.MustParseAddr(ip)); got != want {
+			t.Errorf("%s = %q, want %q", ip, got, want)
+		}
+	}
+}
+
+// Broken and hostile files must never panic or hang: they either fail to load or answer "".
+func TestBrokenMMDBFiles(t *testing.T) {
+	files, _ := filepath.Glob("testdata/*.mmdb")
+	ips := []string{"1.1.1.1", "1.1.1.3", "1.1.1.32", "81.2.69.160", "::1.1.1.1", "2001:218::1", "::2:0:0", "255.255.255.255"}
+	for _, f := range files {
+		buf, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cut := range []int{len(buf), len(buf) / 2, len(buf) - 20} { // whole file and truncated copies
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("%s (%d bytes): panic: %v", f, cut, r)
+					}
+				}()
+				db, err := parseMMDB(buf[:cut])
+				if err != nil {
+					return
+				}
+				for _, ip := range ips {
+					db.country(netip.MustParseAddr(ip))
+				}
+			}()
+		}
+	}
+}
+
+// A record that is a pointer to itself: an unguarded reader recurses until Go's stack overflows,
+// which is fatal (not a recoverable panic) and would take Traefik down.
+func TestSelfPointer(t *testing.T) {
+	db, err := parseMMDB(writeMMDB(t, 24, map[string]int{"1.2.3.0/24": 0}, [][]byte{eptr(0)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := db.country(netip.MustParseAddr("1.2.3.4")); got != "" {
+		t.Errorf("got %q", got)
+	}
+}
