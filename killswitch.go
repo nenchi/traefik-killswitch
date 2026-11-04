@@ -963,7 +963,7 @@ func (k *KillSwitch) serveAdmin(rw http.ResponseWriter, req *http.Request) {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if a := req.PostForm.Get("action"); a == "geo-allow" || a == "geo-remove" {
+		if a := req.PostForm.Get("action"); strings.HasPrefix(a, "geo-") {
 			k.postGeo(rw, req, a)
 			return
 		}

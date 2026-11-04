@@ -164,11 +164,13 @@ its normal mode. Nobody has to be around to switch it off or back on.
 ## Country allow-list (geo)
 
 Add `geo` to a gate middleware and only visitors from the countries on a list get through; everyone else
-gets `403`. The list is edited on the admin page (**Countries**) and applies on the next request:
+gets `403`. The list is edited on the admin page (**Countries**, at the top) and applies on the next request:
 
 - **Allow** a country permanently, or for 1, 7, 14 or 30 days (it is removed again when the time is up).
 - **×** removes a country.
 - **Refused since Traefik started** shows which countries were turned away, with a one-click **allow**.
+- **turn off / turn on** switches the whole country check off (every country gets through) and back on;
+  the list is kept meanwhile.
 
 Every change is logged and kept in the History like the other switches.
 
@@ -226,7 +228,8 @@ Good to know:
 - The list is the same for every site behind gates with `geo`. Codes are ISO 3166-1 alpha-2; Cloudflare
   also sends `XX` (unknown) and `T1` (Tor), which you can allow like any other code.
 - Locked yourself out? Connect through an `allowNetworks` address (VPN), or edit `@geo` in the state file:
-  `"@geo": "DE,AT,ES@2026-11-11T18:00:00+01:00"` (a country with `@time` is allowed until then).
+  `"@geo": "DE,AT,ES@2026-11-11T18:00:00+01:00"` (a country with `@time` is allowed until then). While the check is
+  switched off, the state file has an `"@geo-off"` entry; deleting it switches it back on.
 
 ## Logging
 

@@ -346,6 +346,27 @@ func TestGeoAdmin(t *testing.T) {
 	if from("AT") != 403 || !strings.Contains(adminPage(t, admin), "No country is allowed") {
 		t.Error("empty list should block every country and warn")
 	}
+	// switched off: everyone passes, the list is kept; on again: enforced again
+	if !strings.Contains(adminPage(t, admin), `value="geo-off">turn off`) {
+		t.Error("no turn-off button")
+	}
+	postForm(admin, url.Values{"action": {"geo-off"}})
+	if from("CN") != 200 || !strings.Contains(adminPage(t, admin), "Off: every country gets through") {
+		t.Error("check switched off, but CN still refused or page doesn't say so")
+	}
+	postForm(admin, url.Values{"action": {"geo-on"}})
+	if from("CN") != 403 {
+		t.Error("check switched on again, but CN passes")
+	}
+	if rec := postForm(admin, url.Values{"action": {"geo-bogus"}, "country": {"DE"}}); rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown geo action: got %d", rec.Code)
+	}
+	hist, _ = os.ReadFile(state + ".history")
+	for _, want := range []string{"geo: country check switched OFF", "geo: country check switched on"} {
+		if !strings.Contains(string(hist), want) {
+			t.Errorf("history lacks %q", want)
+		}
+	}
 	// @geo is not a host
 	if !strings.Contains(adminPage(t, admin), `id="geo"`) || strings.Contains(adminPage(t, admin), `value="@geo"`) {
 		t.Error("@geo listed as a host")

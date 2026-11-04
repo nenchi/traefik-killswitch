@@ -199,6 +199,10 @@ expect "geo: ES on next request" "$(gcode ES)" 418
 expect "geo: remove DE"       "$(post -d 'action=geo-remove&country=DE')" 303
 expect "geo: DE now refused"  "$(gcode DE)" 403
 expect "geo: web gate has no geo" "$(code a.lan)" 418
+expect "geo: switch check off" "$(post -d 'action=geo-off')" 303
+expect "geo: off lets CN in"  "$(gcode CN)" 418
+expect "geo: switch check on"  "$(post -d 'action=geo-on')" 303
+expect "geo: on refuses CN"   "$(gcode CN)" 403
 for want in 'INF KILL-SWITCH: geo: ES allowed until' 'INF KILL-SWITCH: geo: DE removed'; do
   grep -q "$want" "$RUN/traefik.log" && echo "ok   log: $want" || { echo "FAIL log missing: $want"; exit 1; }
 done

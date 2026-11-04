@@ -28,7 +28,10 @@ type GeoConfig struct {
 	Unknown        string   `json:"unknown,omitempty"`        // "block" (default) or "allow": no country found
 }
 
-const geoKey = "@geo" // state key of the allow-list; host names never start with "@"
+const (
+	geoKey    = "@geo"     // state key of the allow-list; host names never start with "@"
+	geoOffKey = "@geo-off" // set (to who/when) while the country check is switched off on the admin page
+)
 
 type geoPolicy struct {
 	header       string
@@ -261,6 +264,10 @@ func (k *KillSwitch) geoPass(req *http.Request) bool {
 	if g == nil {
 		return true
 	}
+	state := k.load()
+	if state[geoOffKey] != "" {
+		return true
+	}
 	ip, viaProxy := g.client(req)
 	if ip.IsValid() && inAny(g.allow, ip) {
 		return true
@@ -272,7 +279,7 @@ func (k *KillSwitch) geoPass(req *http.Request) bool {
 		}
 		return g.unknownAllow
 	}
-	if geoAllows(geoList(k.load()), code, now()) {
+	if geoAllows(geoList(state), code, now()) {
 		return true
 	}
 	noteBlocked(code)
@@ -322,15 +329,33 @@ func (k *KillSwitch) postGeo(rw http.ResponseWriter, req *http.Request, action s
 	fail := func(msg string) {
 		http.Redirect(rw, req, req.URL.Path+"?err="+url.QueryEscape(msg)+"#geo", http.StatusSeeOther)
 	}
-	code := normCountry(req.PostForm.Get("country"))
-	if code == "" {
-		fail("enter a two-letter country code, e.g. ES")
-		return
-	}
 	user, ip := actor(req)
 	who := " from " + ip
 	if user != "" {
 		who = " by " + user + who
+	}
+	if action == "geo-off" || action == "geo-on" {
+		err := k.writeState(func(state map[string]string) {
+			if action == "geo-off" {
+				state[geoOffKey] = now().Format(time.RFC3339) + who
+			} else {
+				delete(state, geoOffKey)
+			}
+		})
+		if err != nil {
+			log.Printf("killswitch %s: saving countries: %v", k.name, err)
+			fail("Save failed: " + err.Error())
+			return
+		}
+		k.record("%s", map[string]string{"geo-off": "geo: country check switched OFF, every country gets through",
+			"geo-on": "geo: country check switched on"}[action]+who)
+		http.Redirect(rw, req, req.URL.Path+"#geo", http.StatusSeeOther)
+		return
+	}
+	code := normCountry(req.PostForm.Get("country"))
+	if code == "" {
+		fail("enter a two-letter country code, e.g. ES")
+		return
 	}
 	var msg string
 	var err error
@@ -363,7 +388,7 @@ func (k *KillSwitch) postGeo(rw http.ResponseWriter, req *http.Request, action s
 		if !until.IsZero() {
 			msg += " until " + until.In(time.Local).Format(timeFmt+" MST")
 		}
-	} else {
+	} else if action == "geo-remove" {
 		err = k.setGeo(func(list []geoEntry) []geoEntry {
 			out := []geoEntry{}
 			for _, e := range list {
@@ -374,6 +399,9 @@ func (k *KillSwitch) postGeo(rw http.ResponseWriter, req *http.Request, action s
 			return out
 		})
 		msg = "geo: " + code + " removed"
+	} else {
+		http.Error(rw, "unknown action", http.StatusBadRequest)
+		return
 	}
 	if err != nil {
 		log.Printf("killswitch %s: saving countries: %v", k.name, err)
@@ -394,7 +422,23 @@ func geoForm(action, code, label, extra string) string {
 func geoHTML(state map[string]string, t time.Time) string {
 	var b strings.Builder
 	b.WriteString(`<h2 id="geo">Countries</h2><p>Only visitors from these countries get through, on every site behind a gate with <code>geo</code> ` +
-		`(always-on hosts included). <code>allowNetworks</code> (LAN, VPN) always pass.</p><div class="card"><div class="row"><div class="chips">`)
+		`(always-on hosts included). <code>allowNetworks</code> (LAN, VPN) always pass.</p><div class="card">`)
+	off := state[geoOffKey]
+	if off != "" {
+		since := off
+		if i := strings.Index(off, " "); i > 0 {
+			if ts, err := time.Parse(time.RFC3339, off[:i]); err == nil {
+				since = ts.In(time.Local).Format(timeFmt) + off[i:]
+			}
+		}
+		b.WriteString(`<div class="row all"><div class="host">Country check<small class="bad">Off: every country gets through (since ` +
+			html.EscapeString(since) + `)</small></div><span class="pill block">off</span>` +
+			`<form method="post"><button class="on" name="action" value="geo-on">turn on</button></form></div>`)
+	} else {
+		b.WriteString(`<div class="row all"><div class="host">Country check<small>The list below is enforced</small></div><span class="pill on">on</span>` +
+			`<form method="post"><button class="block" name="action" value="geo-off">turn off</button></form></div>`)
+	}
+	b.WriteString(`<div class="row"><div class="chips">`)
 	list := geoList(state)
 	sort.Slice(list, func(i, j int) bool { return list[i].code < list[j].code })
 	for _, e := range list {
