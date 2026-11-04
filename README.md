@@ -41,7 +41,7 @@ experimental:
   plugins:
     killswitch:
       moduleName: github.com/nenchi/traefik-killswitch
-      version: v0.6.0
+      version: v0.6.1
 ```
 
 Or as a local plugin, e.g. while testing a fork. Mount the repo at
@@ -165,7 +165,9 @@ its normal mode. Nobody has to be around to switch it off or back on.
 ## Country allow-list (geo)
 
 **Off by default.** If you only want maintenance and block, leave `geo` out: there's no country check and no
-Countries card on the admin page, exactly as before v0.6.0.
+Countries card on the admin page, exactly as before v0.6.0. The card appears as soon as at least one gate
+middleware has `geo`, and the list then applies to the sites behind those gates. Gates without `geo` keep
+working as plain kill switches, so you can geoblock some routers and not others.
 
 Add `geo` to a gate middleware and only visitors from the countries on a list get through; everyone else
 gets `403`. The list is edited on the admin page (**Countries**, at the top) and applies on the next request:
