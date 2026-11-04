@@ -209,6 +209,39 @@ http:
             # unknown: block           # no country found: block (default) or allow
 ```
 
+### Only some sites geoblocked
+
+Use two gate middlewares with the same `stateFile`: a plain one for every site, and one with `geo` for the
+routers that should be geoblocked. Both are switched from the same admin page.
+
+```yaml
+http:
+  middlewares:
+    killswitch:                    # plain kill switch, e.g. on the entry point for every site
+      plugin:
+        killswitch:
+          stateFile: /data/killswitch.json
+    killswitch-geo:                # the same, plus the country check
+      plugin:
+        killswitch:
+          stateFile: /data/killswitch.json
+          geo:
+            countryHeader: CF-IPCountry
+            trustedProxies: [173.245.48.0/20]   # ... all of https://www.cloudflare.com/ips/
+            allowNetworks: [192.168.0.0/16, 10.0.0.0/8]
+            countries: [DE, AT, CH]
+```
+
+Then attach `killswitch-geo` to the routers that need it, e.g. with a Docker label:
+
+```yaml
+labels:
+  - "traefik.http.routers.wiki.middlewares=killswitch-geo@file"
+```
+
+Sites behind `killswitch` only are reachable from every country; sites behind `killswitch-geo` follow the
+Countries list on the admin page.
+
 | `geo` option     | Description |
 |------------------|-------------|
 | `countryHeader`  | Header with the visitor's ISO country code. Requires `trustedProxies`. |
