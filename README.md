@@ -220,6 +220,7 @@ http:
               - 10.0.0.0/8
             countries: [DE, AT, CH]    # starting list, until the first change on the admin page
             # unknown: block           # no country found: block (default) or allow
+            # cacheControl: no-cache   # optional: browsers re-check every page, so removing a country applies at once
 ```
 
 ### Only some sites geoblocked
@@ -263,6 +264,7 @@ Countries list on the admin page.
 | `allowNetworks`  | CIDRs that always pass, whatever the list says. Put your LAN and VPN here so you can always reach the admin page. |
 | `countries`      | The list used until the admin page saves one. After that the saved list (`@geo` in the state file) wins. |
 | `unknown`        | `block` (default) or `allow` when no country can be found: a request that didn't come through a trusted proxy and isn't in the GeoIP file, or a missing file. |
+| `cacheControl`   | Optional, off by default. Adds this `Cache-Control` header to responses for visitors outside `allowNetworks`, e.g. `no-cache` (browsers ask the server before reusing a page, so a removed country gets `403` at once instead of seeing pages already in the browser cache) or `no-store` (nothing is cached at all). Costs an extra request per page and file, answered with `304` when nothing changed. It is added next to the app's own header, not instead of it: strict values always win, but it can't make caching looser than the app wants. Pages an app's service worker serves offline aren't affected. |
 
 **GeoIP files.** Free country files in this format: [DB-IP Lite Country](https://db-ip.com/db/download/ip-to-country-lite)
 (CC BY 4.0, no account, monthly) or [MaxMind GeoLite2-Country](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data)

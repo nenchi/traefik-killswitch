@@ -193,6 +193,9 @@ func (k *KillSwitch) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		loggedIn = true
 	}
 	// Excluded hosts (the admin page, the auth provider) are never gated, so "*" can't lock you out.
+	if k.geo != nil && k.geo.cacheControl != "" && !inside {
+		rw.Header().Add("Cache-Control", k.geo.cacheControl) // the proxy adds the app's own header next to it
+	}
 	if excluded {
 		k.next.ServeHTTP(rw, req)
 		return

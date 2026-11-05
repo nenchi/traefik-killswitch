@@ -231,6 +231,7 @@ func TestGeoConfigErrors(t *testing.T) {
 		{GeoIPFile: "x.mmdb", Unknown: "maybe"},
 		{GeoIPFile: "x.mmdb", Countries: []string{"Germany"}},
 		{GeoIPFile: "x.mmdb", AllowNetworks: []string{"not-a-net"}},
+		{GeoIPFile: "x.mmdb", CacheControl: "no-cache\r\nX-Evil: 1"},
 	} {
 		if _, err := New(context.Background(), http.NotFoundHandler(), &Config{StateFile: "s.json", Geo: c}, "bad"); err == nil {
 			t.Errorf("config %+v accepted", *c)
@@ -453,5 +454,51 @@ func TestSelfPointer(t *testing.T) {
 	}
 	if got := db.country(netip.MustParseAddr("1.2.3.4")); got != "" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestGeoCacheControl(t *testing.T) {
+	app := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Add("Cache-Control", "max-age=3600") // like Traefik's proxy copying the app's headers
+		_, _ = rw.Write([]byte("backend"))
+		rw.(http.Flusher).Flush()
+	})
+	get := func(cacheControl, name, remote string, header map[string]string) *httptest.ResponseRecorder {
+		geo := &GeoConfig{CountryHeader: "CF-IPCountry", TrustedProxies: []string{"10.0.0.0/8"},
+			AllowNetworks: []string{"192.168.0.0/16"}, Countries: []string{"DE"}, CacheControl: cacheControl}
+		h, err := New(context.Background(), app, &Config{StateFile: filepath.Join(t.TempDir(), "s.json"), Geo: geo}, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			geoMu.Lock()
+			delete(geoDefault, name)
+			delete(gateAllow, name)
+			geoMu.Unlock()
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://app.example.com/", nil)
+		req.RemoteAddr = remote
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	de := map[string]string{"CF-IPCountry": "DE", "X-Forwarded-For": "203.0.113.5"}
+	for _, c := range []struct {
+		name, cacheControl, remote string
+		header                     map[string]string
+		want                       string
+	}{
+		{"default leaves the app's header", "", "10.1.2.3:443", de, "max-age=3600"},
+		{"set: added for a country visitor", "no-cache", "10.1.2.3:443", de, "no-cache, max-age=3600"},
+		{"set: LAN keeps the app's header", "no-cache", "192.168.1.20:5555", nil, "max-age=3600"},
+	} {
+		rec := get(c.cacheControl, "geo-cc-"+strings.ReplaceAll(c.name, " ", "-"), c.remote, c.header)
+		got := strings.Join(rec.Header().Values("Cache-Control"), ", ")
+		if rec.Code != 200 || got != c.want || !rec.Flushed {
+			t.Errorf("%s: code %d, Cache-Control %q (want %q), flushed %v", c.name, rec.Code, got, c.want, rec.Flushed)
+		}
 	}
 }

@@ -26,6 +26,8 @@ entryPoints:
       trustedIPs: ["127.0.0.1"]
     http:
       middlewares: [geogate@file]
+  app:
+    address: "127.0.0.1:18084"
 api:
   insecure: true
 providers:
@@ -60,6 +62,11 @@ http:
             countryHeader: X-Country
             trustedProxies: ["127.0.0.1/32"]
             countries: [DE]
+            cacheControl: no-cache
+    appcache:
+      headers:
+        customResponseHeaders:
+          Cache-Control: max-age=3600
     ks-admin:
       plugin:
         killswitch:
@@ -71,7 +78,20 @@ http:
       loadBalancer:
         servers:
           - url: http://127.0.0.1:9
+    appsvc:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:18084
   routers:
+    app-backend:
+      entryPoints: [app]
+      rule: Host(\`cc.lan\`)
+      middlewares: [appcache]
+      service: noop@internal
+    geo-cc:
+      entryPoints: [geo]
+      rule: Host(\`cc.lan\`)
+      service: appsvc
     a:
       entryPoints: [web]
       rule: Host(\`a.lan\`)
@@ -198,6 +218,9 @@ echo "$PAGE" | grep -q '<li>ks.lan</li>' && echo "ok   admin lists excluded host
 gcode() { curl -s -o /dev/null -w '%{http_code}' -H 'Host: g.lan' ${1:+-H "X-Country: $1"} http://127.0.0.1:18083/; }
 expect "geo: allowed country" "$(gcode DE)" 418
 expect "geo: other country"   "$(gcode ES)" 403
+cc() { curl -s -o /dev/null -D - -H 'Host: cc.lan' -H 'X-Country: DE' "$@" http://127.0.0.1:18083/ | grep -i '^cache-control' | tr -d '\r' | paste -sd'|'; }
+expect "geo: cacheControl added next to the app's" "$(cc)" "Cache-Control: no-cache|Cache-Control: max-age=3600"
+expect "geo: cacheControl skips LAN" "$(cc -H 'X-Forwarded-For: 192.168.1.5')" "Cache-Control: max-age=3600"
 expect "geo: no country"      "$(gcode)" 403
 curl -s http://127.0.0.1:18081/ | grep -q 'ES <small>1</small>' && echo "ok   admin shows refused ES" || { echo "FAIL refused ES not shown"; exit 1; }
 expect "geo: allow ES 7 days" "$(post -d 'action=geo-allow&country=ES&days=7')" 303

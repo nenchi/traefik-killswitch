@@ -26,6 +26,11 @@ type GeoConfig struct {
 	AllowNetworks  []string `json:"allowNetworks,omitempty"`  // CIDRs that always pass: LAN, VPN
 	Countries      []string `json:"countries,omitempty"`      // initial allow-list (ISO 3166-1 alpha-2)
 	Unknown        string   `json:"unknown,omitempty"`        // "block" (default) or "allow": no country found
+	// CacheControl, when set, is added as a Cache-Control header to responses for visitors outside allowNetworks,
+	// e.g. "no-cache" so browsers ask again and a removed country is refused at once. Empty = untouched (default).
+	// ponytail: added, not replaced: a ResponseWriter wrapper under Yaegi loses Flush or Hijack (streaming or
+	// WebSockets). Strict values (no-cache, no-store, max-age=0) win anyway; to loosen an app's caching, ask the app.
+	CacheControl string `json:"cacheControl,omitempty"`
 }
 
 const (
@@ -38,6 +43,7 @@ type geoPolicy struct {
 	net          *netPolicy
 	file         string
 	unknownAllow bool
+	cacheControl string
 }
 
 // netPolicy says who the visitor is and whether they are "inside": trusted proxies (whose X-Forwarded-For is
@@ -76,12 +82,16 @@ func newGeoPolicy(c *GeoConfig, n *netPolicy) (*geoPolicy, error) {
 	if c.Unknown != "" && c.Unknown != "block" && c.Unknown != "allow" {
 		return nil, fmt.Errorf("geo: unknown must be block or allow, not %q", c.Unknown)
 	}
+	if strings.ContainsAny(c.CacheControl, "\r\n") {
+		return nil, fmt.Errorf("geo: cacheControl must be one line")
+	}
 	for _, cc := range c.Countries {
 		if normCountry(cc) == "" {
 			return nil, fmt.Errorf("geo countries: %q is not a two-letter country code", cc)
 		}
 	}
-	return &geoPolicy{header: c.CountryHeader, net: n, file: c.GeoIPFile, unknownAllow: c.Unknown == "allow"}, nil
+	return &geoPolicy{header: c.CountryHeader, net: n, file: c.GeoIPFile, unknownAllow: c.Unknown == "allow",
+		cacheControl: strings.TrimSpace(c.CacheControl)}, nil
 }
 
 // parsePrefixes accepts CIDRs and single addresses; entries may also be comma-separated (Docker labels, env vars).
