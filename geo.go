@@ -34,8 +34,9 @@ type GeoConfig struct {
 }
 
 const (
-	geoKey    = "@geo"     // state key of the allow-list; host names never start with "@"
-	geoOffKey = "@geo-off" // set (to who/when) while the country check is switched off on the admin page
+	geoKey    = "@geo"       // state key of the allow-list; host names never start with "@"
+	geoOffKey = "@geo-off"   // set (to who/when) while the country check is switched off on the admin page
+	geoCache  = "@geo-cache" // Cache-Control chosen on the admin page: "normal", "no-cache" or "no-store"
 )
 
 type geoPolicy struct {
@@ -288,6 +289,21 @@ func noteBlocked(code string) {
 	geoMu.Unlock()
 }
 
+// cacheControlFor is the Cache-Control a gate adds for visitors outside allowNetworks: the admin page's choice,
+// else the configured cacheControl. "" = leave the app's caching alone.
+func (k *KillSwitch) cacheControlFor(state map[string]string) string {
+	if k.geo == nil {
+		return ""
+	}
+	switch v := state[geoCache]; v {
+	case "no-cache", "no-store":
+		return v
+	case "normal":
+		return ""
+	}
+	return k.geo.cacheControl
+}
+
 // geoPass decides the request: allowNetworks always pass, then the visitor's country must be on the list.
 func (k *KillSwitch) geoPass(req *http.Request) bool {
 	g := k.geo
@@ -363,6 +379,21 @@ func (k *KillSwitch) postGeo(rw http.ResponseWriter, req *http.Request, action s
 	who := " from " + ip
 	if user != "" {
 		who = " by " + user + who
+	}
+	if action == "geo-cache" {
+		v := req.PostForm.Get("cache")
+		if v != "normal" && v != "no-cache" && v != "no-store" {
+			fail("browser cache must be normal, no-cache or no-store")
+			return
+		}
+		if err := k.writeState(func(state map[string]string) { state[geoCache] = v }); err != nil {
+			log.Printf("killswitch %s: saving countries: %v", k.name, err)
+			fail("Save failed: " + err.Error())
+			return
+		}
+		k.record("geo: browser cache set to %s%s", v, who)
+		http.Redirect(rw, req, req.URL.Path+"#geo", http.StatusSeeOther)
+		return
 	}
 	if action == "geo-off" || action == "geo-on" {
 		err := k.writeState(func(state map[string]string) {
@@ -468,6 +499,22 @@ func geoHTML(state map[string]string, t time.Time) string {
 		b.WriteString(`<div class="row all"><div class="host">Country check<small>The list below is enforced</small></div><span class="pill on">on</span>` +
 			`<form method="post"><button class="block" name="action" value="geo-off">turn off</button></form></div>`)
 	}
+	cur := state[geoCache]
+	if cur == "" {
+		cur = "normal"
+	}
+	b.WriteString(`<div class="row all"><div class="host">Browser cache<small>For visitors from countries (not LAN/VPN). ` +
+		`no-cache: browsers re-check every page, so a removed country is blocked at once, also in open tabs. ` +
+		`no-store: nothing is cached. normal: the sites decide.</small></div>` +
+		`<form method="post"><input type="hidden" name="action" value="geo-cache"><select name="cache" aria-label="Browser cache" onchange="this.form.submit()">`)
+	for _, v := range []string{"normal", "no-cache", "no-store"} {
+		sel := ""
+		if v == cur {
+			sel = " selected"
+		}
+		b.WriteString(`<option value="` + v + `"` + sel + `>` + v + `</option>`)
+	}
+	b.WriteString(`</select><noscript><button>save</button></noscript></form></div>`)
 	b.WriteString(`<div class="row"><div class="chips">`)
 	list := geoList(state)
 	sort.Slice(list, func(i, j int) bool { return list[i].code < list[j].code })

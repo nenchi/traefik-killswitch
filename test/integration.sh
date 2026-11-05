@@ -62,7 +62,7 @@ http:
             countryHeader: X-Country
             trustedProxies: ["127.0.0.1/32"]
             countries: [DE]
-            cacheControl: no-cache
+            cacheControl: no-cache   # the admin page's choice overrides it (tested below)
     appcache:
       headers:
         customResponseHeaders:
@@ -220,9 +220,16 @@ expect "geo: allowed country" "$(gcode DE)" 418
 expect "geo: other country"   "$(gcode ES)" 403
 cc() { curl -s -o /dev/null -D - -H 'Host: cc.lan' -H 'X-Country: DE' "$@" http://127.0.0.1:18083/ | grep -i '^cache-control' | tr -d '\r' | paste -sd'|'; }
 expect "geo: cacheControl added next to the app's" "$(cc)" "Cache-Control: no-cache|Cache-Control: max-age=3600"
-expect "geo: cacheControl skips LAN" "$(cc -H 'X-Forwarded-For: 192.168.1.5')" "Cache-Control: max-age=3600"
+
 expect "geo: no country"      "$(gcode)" 403
 curl -s http://127.0.0.1:18081/ | grep -q 'ES <small>1</small>' && echo "ok   admin shows refused ES" || { echo "FAIL refused ES not shown"; exit 1; }
+expect "geo: cacheControl skips LAN" "$(cc -H 'X-Forwarded-For: 192.168.1.5')" "Cache-Control: max-age=3600"
+expect "geo: admin sets browser cache no-store" "$(post -d 'action=geo-cache&cache=no-store')" 303
+expect "geo: admin choice applies" "$(cc)" "Cache-Control: no-store|Cache-Control: max-age=3600"
+post -d 'action=geo-cache&cache=public' >/dev/null
+expect "geo: admin refuses other values" "$(cc)" "Cache-Control: no-store|Cache-Control: max-age=3600"
+expect "geo: admin sets browser cache normal" "$(post -d 'action=geo-cache&cache=normal')" 303
+expect "geo: normal leaves the app's header" "$(cc)" "Cache-Control: max-age=3600"
 expect "geo: allow ES 7 days" "$(post -d 'action=geo-allow&country=ES&days=7')" 303
 expect "geo: ES on next request" "$(gcode ES)" 418
 expect "geo: remove DE"       "$(post -d 'action=geo-remove&country=DE')" 303

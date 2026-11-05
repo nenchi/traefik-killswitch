@@ -463,10 +463,16 @@ func TestGeoCacheControl(t *testing.T) {
 		_, _ = rw.Write([]byte("backend"))
 		rw.(http.Flusher).Flush()
 	})
-	get := func(cacheControl, name, remote string, header map[string]string) *httptest.ResponseRecorder {
+	get := func(cacheControl, saved, name, remote string, header map[string]string) *httptest.ResponseRecorder {
+		stateFile := filepath.Join(t.TempDir(), "s.json")
+		if saved != "" {
+			if err := os.WriteFile(stateFile, []byte(`{"@geo-cache":"`+saved+`"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
 		geo := &GeoConfig{CountryHeader: "CF-IPCountry", TrustedProxies: []string{"10.0.0.0/8"},
 			AllowNetworks: []string{"192.168.0.0/16"}, Countries: []string{"DE"}, CacheControl: cacheControl}
-		h, err := New(context.Background(), app, &Config{StateFile: filepath.Join(t.TempDir(), "s.json"), Geo: geo}, name)
+		h, err := New(context.Background(), app, &Config{StateFile: stateFile, Geo: geo}, name)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -487,15 +493,18 @@ func TestGeoCacheControl(t *testing.T) {
 	}
 	de := map[string]string{"CF-IPCountry": "DE", "X-Forwarded-For": "203.0.113.5"}
 	for _, c := range []struct {
-		name, cacheControl, remote string
-		header                     map[string]string
-		want                       string
+		name, cacheControl, saved, remote string
+		header                            map[string]string
+		want                              string
 	}{
-		{"default leaves the app's header", "", "10.1.2.3:443", de, "max-age=3600"},
-		{"set: added for a country visitor", "no-cache", "10.1.2.3:443", de, "no-cache, max-age=3600"},
-		{"set: LAN keeps the app's header", "no-cache", "192.168.1.20:5555", nil, "max-age=3600"},
+		{"default leaves the app's header", "", "", "10.1.2.3:443", de, "max-age=3600"},
+		{"config: added for a country visitor", "no-cache", "", "10.1.2.3:443", de, "no-cache, max-age=3600"},
+		{"config: LAN keeps the app's header", "no-cache", "", "192.168.1.20:5555", nil, "max-age=3600"},
+		{"admin page choice wins over no config", "", "no-store", "10.1.2.3:443", de, "no-store, max-age=3600"},
+		{"admin page normal wins over config", "no-cache", "normal", "10.1.2.3:443", de, "max-age=3600"},
+		{"junk in the state file is ignored", "", "public, max-age=99", "10.1.2.3:443", de, "max-age=3600"},
 	} {
-		rec := get(c.cacheControl, "geo-cc-"+strings.ReplaceAll(c.name, " ", "-"), c.remote, c.header)
+		rec := get(c.cacheControl, c.saved, "geo-cc-"+strings.ReplaceAll(c.name, " ", "-"), c.remote, c.header)
 		got := strings.Join(rec.Header().Values("Cache-Control"), ", ")
 		if rec.Code != 200 || got != c.want || !rec.Flushed {
 			t.Errorf("%s: code %d, Cache-Control %q (want %q), flushed %v", c.name, rec.Code, got, c.want, rec.Flushed)
