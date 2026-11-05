@@ -476,7 +476,9 @@ func geoHTML(state map[string]string, t time.Time) string {
 		`required aria-label="Country code" style="flex:0 0 5rem;text-transform:uppercase">` +
 		`<select name="days" aria-label="How long"><option value="">permanently</option><option value="1">for 1 day</option>` +
 		`<option value="7">for 7 days</option><option value="14">for 14 days</option><option value="30">for 30 days</option></select>` +
-		`<button>Allow</button></form></div>`)
+		`<button>Allow</button>` +
+		`<a href="https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2#Officially_assigned_code_elements" target="_blank" rel="noopener noreferrer">country codes</a>` +
+		`</form></div>`)
 	geoMu.Lock()
 	type count struct {
 		code string
