@@ -11,7 +11,7 @@ permissions:
 
 env:
   # renovate: datasource=github-releases depName=traefik/traefik
-  TRAEFIK_VERSION: v3.7.18
+  TRAEFIK_VERSION: v3.7.19
   # renovate: datasource=github-releases depName=traefik/yaegi
   YAEGI_VERSION: v0.16.3
 
